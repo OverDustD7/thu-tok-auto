@@ -2,3 +2,6 @@ node_modules/
 coverage/
 *.tgz
 *.log
+
+# Review report stays local-only
+DSH插件检查与修改报告.md
