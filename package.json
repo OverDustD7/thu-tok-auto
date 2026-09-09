@@ -1,10 +1,12 @@
 {
   "name": "thu-tok-auto",
-  "version": "0.2.0",
-  "description": "Get / auto-refresh THU MadModel (madmodel.cs.tsinghua.edu.cn) API tokens and write them straight into the DSH model provider config (credential MADMODEL_API_KEY).",
+  "version": "0.2.1",
+  "description": "Get / auto-refresh THU MadModel (madmodel.cs.tsinghua.edu.cn) API tokens and write them straight into the DSH model provider config (credential MADMODEL_API_KEY). Installs as a DSH profile bundle (Cordis plugin).",
   "type": "module",
+  "main": "lib/index.js",
   "files": [
     "lib",
+    "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
@@ -12,9 +14,17 @@
     "node": ">=22"
   },
   "scripts": {
-    "check": "node test/check.mjs",
     "test": "node --test test/*.test.mjs",
+    "check": "node --check lib/index.js && node --check lib/core.js && node --check lib/ui.js && node test/check.mjs",
     "prepack": "npm run check && npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OverDustD7/thu-tok-auto.git"
+  },
+  "homepage": "https://github.com/OverDustD7/thu-tok-auto#readme",
+  "bugs": {
+    "url": "https://github.com/OverDustD7/thu-tok-auto/issues"
   },
   "keywords": [
     "dsh",
@@ -26,5 +36,10 @@
     "auto-refresh",
     "cordis-plugin"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
 }

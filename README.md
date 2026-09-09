@@ -8,18 +8,36 @@ DSH / DeepSeek Harness 的 Cordis 插件：一键获取清华大学 MadModel 平
   写入 DSH 凭据 `MADMODEL_API_KEY` 并自动创建/复用模型 Provider
   `llm-pi-ai.providers.madmodel`（baseURL 指向 madmodel）。
 - **Auto**：开关自动续期。开启后计时超过 **05:50** 自动触发 Get，
-  自动任务运行在 Host 侧，即使页面刷新后按钮暂时消失也会继续工作。
+  自动任务运行在 Host 侧，与页面是否打开无关。
 - **计时器**：显示「距最近一次 Get 的本地经过时间」`hh:mm`；
   达到 100 小时后显示 `Too Long!`（表示该去管管了）。
   悬浮提示同时给出剩余有效期（如「剩余 5h12m」）。
 
 默认显示在左下角侧边栏（设置区上方），14px，与 DSH 主题一致。
 
+## 安装
+
+作为 **DSH profile bundle**（正式 npm 插件）安装，随 profile 声明同步：
+
+```sh
+dsh plugin --profile web add thu-tok-auto
+```
+
+然后**重启 DSH Web**（或对应 profile）使插件加载。也可手动在
+`~/.dsh/profiles/web/package.json` 的 `dependencies` 与 `dsh.profile.bundles`
+中加入 `thu-tok-auto` 后重新安装。
+
+更新：
+
+```sh
+dsh plugin --profile web up thu-tok-auto
+```
+
 ## 使用
 
-1. 在 DSH 中加载本插件（动态 Cordis 插件，见「分发形态」）。
+1. 安装并重启后，左下角出现 **[●] [Get] [Auto] | hh:mm** 控件；
 2. 点 **Get** —— 校园网内直接签发成功，绿点亮起，token 已写入；
-3. 点 **Auto**（显示 `Auto ✓`）开启自动续期。
+3. 点 **Auto**（显示 `Auto ✓`，绿色底白字）开启自动续期。
 
 校外或凭据失效时的兜底：Get 会自动回退到已保存 SSO 会话；仍无法签发时，
 手动点击 Get 会打开 Edge/Chrome 登录窗口，登录完成后自动捕获并继续。
@@ -59,13 +77,11 @@ DSH / DeepSeek Harness 的 Cordis 插件：一键获取清华大学 MadModel 平
 
 ## 平台限制（重要）
 
-DSH 的动态 Client 插件在**页面硬刷新（F5）后不会自动重新挂载**：
-刷新后按钮会消失，但 Host 侧的 Auto 续期仍正常运行。恢复方法：重新激活该插件
-（例如在 DSH 会话中对该插件重新 run/update），当前已打开的页面会通过
-热更新自动恢复 UI，**无需再次刷新页面**。
-
-日常使用建议：避免刷新 DSH 页面；UI 信息（状态、计时）会通过内部 RPC
-每 10 秒自动更新。
+- 插件以 profile bundle 形式运行在 DSH 宿主进程，UI 由宿主在每次整页加载时
+  注入全局脚本：**页面刷新（F5）后按钮自动重新出现**（不再需要重新激活插件）。
+- UI 信息（状态、计时基准）通过 `/thu-tok-auto/api/*` 每 10 秒轮询更新，
+  计时器本身在页面本地每秒走字。
+- 本机浏览器登录捕获依赖 Edge/Chrome 的 DevTools 调试端口（本机 9333–9343）。
 
 ## 状态与文件
 
@@ -74,23 +90,34 @@ DSH 的动态 Client 插件在**页面硬刷新（F5）后不会自动重新挂�
   会迁移到 DSH 凭据存储，并从状态文件移除。
 - 登录浏览器配置目录：`%USERPROFILE%\.dsh\madmodel\profile\`；从本机 CDP 端口
   9333–9343 中选择未占用端口，只连接 URL 主机名严格匹配清华域的页面。
-- token 只写入 DSH 凭据引用 `MADMODEL_API_KEY`，不会通过 RPC 发给浏览器，
-  也不会出现在辅助进程命令行中。
+- token 只写入 DSH 凭据引用 `MADMODEL_API_KEY`，不会通过 HTTP 发给浏览器，
+  也不会出现在任何子进程命令行中。
 - 无任何遥测；网络访问仅限 MadModel 与清华统一身份认证域名，以及本机 CDP。
 
 ## 兼容性与验证
 
-- Node.js >= 22（登录捕获使用 Node 内置 WebSocket）；已按 DSH `0.1.2-rc.1`
-  的动态 Cordis、settings、credentials、subprocess 与 `llm-pi-ai` 接口检查。
-- `npm run check`：检查动态 Host/Client 函数体语法。
+- Node.js >= 22（登录捕获使用 Node 内置 WebSocket 与 fetch）；已按 DSH
+  `0.1.2-rc.1` 的 profile bundle（`dsh.bundle.patch`）、settings、credentials、
+  timer、webServer、connection 与 `llm-pi-ai` 接口核对。
+- `npm run check`：检查 Host/核心/UI 语法与补丁声明。
 - `npm test`：运行 token 生命周期、Provider 写入、Host Auto、登录捕获与敏感信息
-  边界回归测试。
+  边界回归测试（发布前 prepack 自动执行）。
 
-## 分发形态
+## 开发与源码
 
-当前为 **DSH 会话内动态 Cordis 插件源码**：`lib/host.js` 与 `lib/client.js`
-分别是 Host/Client 两半。动态 pluginId/packageId 由具体 DSH 会话分配，源码
-更新后需要在目标会话中重新 define/update 并激活；正式 npm / GitHub 发布待定。
+- GitHub：<https://github.com/OverDustD7/thu-tok-auto>
+- npm：<https://www.npmjs.com/package/thu-tok-auto>
+- 源码结构：
+  - `lib/core.js` —— 核心逻辑（依赖注入，可独立单测）：获取阶梯、凭据/配置写入、
+    状态迁移、Auto 判据、登录捕获编排；
+  - `lib/index.js` —— Cordis 插件入口：装配真实环境（Node fetch/WebSocket/fs、
+    DSH settings/credentials/timer/webServer/connection），提供
+    `/thu-tok-auto/api/*` 与 UI 注入；
+  - `lib/ui.js` —— 浏览器端全局脚本 UI。
+
+`0.2.0` 及更早版本为「DSH 会话内动态 Cordis 插件」形态（`lib/host.js` /
+`lib/client.js`）；`0.2.1` 起改为可直接安装的 profile bundle。行为与状态文件
+路径保持一致，切换无需迁移。
 
 ## License
 

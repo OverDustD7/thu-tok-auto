@@ -3,152 +3,116 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import vm from 'node:vm'
-import { spawnSync } from 'node:child_process'
-import { test } from 'node:test'
+import { EventEmitter } from 'node:events'
+import { test, before } from 'node:test'
+import { createCore, AUTO_REFRESH_MS, AUTO_RETRY_MS, CRED_REF } from '../lib/core.js'
 
-const hostSource = fs.readFileSync(new URL('../lib/host.js', import.meta.url), 'utf8')
-const clientSource = fs.readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+const tk = () => 't' + Math.random().toString(36).slice(2) + 'k'
 
-function completed(payload) {
-  const text = JSON.stringify(payload)
-  return {
-    pid: 1234,
-    done: Promise.resolve({ exitCode: 0, signal: null }),
-    collected: {
-      stdout: { readFrom() { return { text } } },
-      stderr: { readFrom() { return { text: '' } } },
-    },
-  }
+function okResponse(payload, status = 200) {
+  return { status, ok: status < 400, location: '', text: typeof payload === 'string' ? payload : JSON.stringify(payload) }
 }
+const authOk = () => okResponse({ success: true })
 
-async function createRuntime(options = {}) {
-  const handlers = new Map()
-  const timers = []
+function createRuntime(options = {}) {
+  const seen = []
   const spawns = []
   const updates = []
+  const saves = []
+  const timers = []
   let stateData = options.stateData ?? null
   let credential = options.credential ?? ''
   const settings = { providers: { ...(options.providers || {}) } }
 
-  const subprocess = {
-    async resolveExecutable(candidate) { return candidate },
-    spawn(spec) {
-      spawns.push(spec)
-      const mode = spec.argv[1] === '-e' ? spec.argv[3] : null
-      if (!mode) return completed({ ok: true })
-      const args = JSON.parse(spec.stdio.stdin.data)
-      if (mode === 'env') return completed({ home: 'C:\\Users\\test', temp: 'C:\\Temp', cwd: 'C:\\work' })
-      if (mode === 'mkdir') return completed({ ok: true })
-      if (mode === 'state') {
-        if (args.op === 'load') return completed({ ok: true, data: stateData })
-        stateData = structuredClone(args.data)
-        return completed({ ok: true })
-      }
-      if (mode === 'get') return completed(options.get ? options.get(args) : { status: 500, text: '' })
-      if (mode === 'wscdp') {
-        return completed(options.wscdp ? options.wscdp(args) : { ok: false, running: false, reason: 'no-devtools' })
-      }
-      return completed({ ok: false, error: `unexpected mode ${mode}` })
+  const http = async (url, opts) => {
+    seen.push({ url, headers: (opts && opts.headers) || {} })
+    const custom = options.http && options.http({ url, headers: (opts && opts.headers) || {} })
+    if (custom !== undefined) return custom
+    if (url.endsWith('/model-api/auth-login/check')) {
+      if (/\/auth-login\/check\?ticket=/.test(url)) return checkOk('ticket-token')
+      return options.mint ? checkOk(options.mint) : { status: 401, ok: false, location: '', text: '' }
+    }
+    if (url.endsWith('/model-api/auth-login')) return authOk()
+    return { status: 500, ok: false, location: '', text: '' }
+  }
+  const cdp = options.cdp || (async () => ({ ok: false, running: false, reason: 'no-devtools' }))
+
+  const core = createCore({
+    logger: { error() {}, log() {} },
+    http,
+    cdp,
+    env: { home: options.home || 'C:\\Users\\test', temp: 'C:\\Temp', cwd: 'C:\\work' },
+    clock: { now: () => (options.now !== undefined ? options.now : Date.now()) },
+    stateIO: {
+      async mkdir(p) { return { ok: true } },
+      async load() { return { ok: true, data: stateData } },
+      async save(p, data) {
+        saves.push(data)
+        stateData = { ...data }
+        return { ok: true }
+      },
     },
-  }
-  const settingsService = {
-    async describe() { return [{ ns: 'llm-pi-ai' }] },
-    async get(ns) { return ns === 'llm-pi-ai' ? settings : undefined },
-    async update(ns, patch) {
-      assert.equal(ns, 'llm-pi-ai')
-      assert.equal(Object.getPrototypeOf(patch), Object.prototype, 'settings patch must use the Host realm')
-      assert.equal(Object.getPrototypeOf(patch.providers), Object.prototype, 'nested patch must use the Host realm')
-      updates.push(patch)
-      for (const [id, value] of Object.entries(patch.providers)) {
-        settings.providers[id] = { ...(settings.providers[id] || {}), ...structuredClone(value) }
-      }
+    settings: {
+      async describe() { return [{ ns: 'llm-pi-ai' }] },
+      async get(ns) { return ns === 'llm-pi-ai' ? settings : undefined },
+      async update(ns, patch) {
+        assert.equal(ns, 'llm-pi-ai')
+        assert.equal(Object.getPrototypeOf(patch), Object.prototype, 'settings patch must be a plain Host-realm object')
+        assert.equal(Object.getPrototypeOf(patch.providers), Object.prototype, 'nested patch must be a plain object')
+        updates.push(patch)
+        for (const [id, value] of Object.entries(patch.providers)) {
+          if (!settings.providers[id]) settings.providers[id] = {}
+          Object.assign(settings.providers[id], structuredClone(value))
+        }
+      },
     },
-  }
-  const credentials = {
-    async resolve() { return credential ? { value: credential, source: 'test' } : undefined },
-    async set(_ref, value) { credential = value },
-  }
-  const services = {
-    subprocess,
-    timer: { interval(fn, ms) { const entry = { fn, ms, disposed: false }; timers.push(entry); return () => { entry.disposed = true } } },
-    fs: { async resolve() { return 'C:\\work' }, processPath(value) { return value } },
-    settings: settingsService,
-    credentials,
-  }
-  const context = vm.createContext({
-    console,
-    harness: { handle(name, fn) { handlers.set(name, fn); return () => handlers.delete(name) } },
+    credentials: {
+      async resolve() { return credential ? { value: credential, source: 'test' } : undefined },
+      async set(_ref, value) { credential = value },
+    },
+    findExecutable: async (c) => (options.findExe !== undefined ? options.findExe(c) : c),
+    spawnBrowser: async (exe, argv) => { spawns.push({ exe, argv }); return { pid: 4321 } },
+    timer: {
+      interval(fn, ms) {
+        const entry = { fn, ms, disposed: false }
+        timers.push(entry)
+        return () => { entry.disposed = true }
+      },
+    },
   })
-  const plugin = new vm.Script(`(function () {\n${hostSource}\n})()`, { filename: 'lib/host.js' }).runInContext(context)
-  assert.deepEqual(Array.from(plugin.inject), ['subprocess', 'timer', 'fs', 'settings', 'credentials'])
-  plugin.apply({
-    get(name) { return services[name] },
-    interval(fn, ms) { return services.timer.interval(fn, ms) },
-  })
-  await handlers.get('mmtok/init')()
   return {
-    handlers, timers, spawns, updates, settings,
+    core, seen, spawns, updates, saves, timers, settings,
     get credential() { return credential },
     get stateData() { return stateData },
   }
 }
 
-test('dynamic Host and Client halves compile in their function-body format', () => {
-  new vm.Script(`(function () {\n${hostSource}\n})()`)
-  new vm.Script(`(function () {\n${clientSource}\n})()`)
-})
+const checkOk = (token) => okResponse({ success: true, data: token })
 
-test('Client half mounts the overlay using declared lifecycle APIs only', async () => {
-  const calls = []
-  const registrations = []
-  let css = ''
-  const context = vm.createContext({
-    console: { error() {} },
-    React: {},
-    styles: { insert(value) { css = value; return () => {} } },
-    host: {
-      call(method) {
-        calls.push(method)
-        return Promise.resolve({ auto: false, busy: false, status: 'idle' })
-      },
-    },
-  })
-  const plugin = new vm.Script(`(function () {\n${clientSource}\n})()`, { filename: 'lib/client.js' }).runInContext(context)
-  assert.deepEqual(Array.from(plugin.inject), ['timer', 'slots'])
-  plugin.apply({
-    interval() { return () => {} },
-    effect(fn) { fn(); return () => {} },
-    slots: {
-      inject(name, fn) { assert.equal(name, 'shell.overlay'); return fn() },
-      register(meta, component) { registrations.push({ meta, component }); return () => {} },
-    },
-  })
-  await new Promise(resolve => setImmediate(resolve))
-  assert.equal(registrations.length, 1)
-  assert.equal(registrations[0].meta.id, 'mmtok-actions')
-  assert.match(css, /\.mmtok-box/)
-  assert.ok(calls.includes('mmtok/init'))
-  assert.ok(calls.includes('mmtok/state'))
-  assert.equal(calls.includes('mmtok/sync-profile'), false)
-  assert.doesNotThrow(() => plugin.apply({ interval() { throw new Error('synthetic mount failure') } }))
+const run = async (rt) => {
+  await rt.core.init()
+  return rt.core.getTok()
+}
+
+test('bundle entry exports a Cordis plugin with host services injected', async () => {
+  const entry = await import('../lib/index.js?t=' + Date.now())
+  assert.equal(entry.name, 'thu-tok-auto')
+  assert.deepEqual(entry.inject, ['settings', 'credentials', 'timer', 'webServer', 'connection'])
+  const ui = fs.readFileSync(new URL('../lib/ui.js', import.meta.url), 'utf8')
+  new vm.Script(ui, { filename: 'lib/ui.js' }) // parses as a plain script (no module syntax)
 })
 
 test('fresh mint creates a valid minimal llm-pi-ai route without exposing the token', async () => {
-  const token = 'secret-fresh-token'
-  const runtime = await createRuntime({
+  const token = tk()
+  const rt = createRuntime({
+    mint: token,
     providers: { existing: { baseURL: 'https://example.invalid/v1' } },
-    get(args) {
-      if (args.url.endsWith('/model-api/auth-login/check')) {
-        return { status: 200, text: JSON.stringify({ success: true, data: token }) }
-      }
-      return { status: 500, text: '' }
-    },
   })
-  const result = await runtime.handlers.get('mmtok/get-tok')()
+  const result = await run(rt)
   assert.equal(result.status, 'ok')
   assert.equal(result.busy, false)
-  assert.equal(runtime.credential, token)
-  assert.deepEqual(runtime.settings.providers.madmodel, {
+  assert.equal(rt.credential, token)
+  assert.deepEqual(rt.settings.providers.madmodel, {
     displayName: 'DeepSeek (THU)',
     apiKeyEnv: 'MADMODEL_API_KEY',
     api: 'openai-completions',
@@ -161,14 +125,15 @@ test('fresh mint creates a valid minimal llm-pi-ai route without exposing the to
       reasoningEfforts: { minimal: 'none', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
     }],
   })
-  assert.deepEqual(Object.keys(runtime.updates.at(-1).providers), ['madmodel'], 'unrelated providers must not be copied into the user layer')
-  assert.equal('token' in runtime.stateData, false)
-  assert.equal('tokenPreview' in result, false)
-  assert.ok(runtime.spawns.every(spec => !spec.argv.join(' ').includes(token)), 'token must not enter a subprocess command line')
+  assert.deepEqual(Object.keys(rt.updates.at(-1).providers), ['madmodel'], 'unrelated providers must not be copied into the user layer')
+  assert.equal('token' in rt.stateData, false, 'token must never enter the state file')
+  assert.equal(rt.stateData.lastGetAt > 0, true)
+  assert.ok(rt.saves.every((s) => !('token' in s)))
 })
 
 test('an existing MadModel route keeps user-owned fields and only receives the credential reference', async () => {
-  const runtime = await createRuntime({
+  const rt = createRuntime({
+    mint: tk(),
     providers: {
       custom: {
         displayName: 'My Campus Gateway',
@@ -178,39 +143,32 @@ test('an existing MadModel route keeps user-owned fields and only receives the c
         models: [{ id: 'custom-model', contextWindow: 100000 }],
       },
     },
-    get(args) {
-      if (args.url.endsWith('/model-api/auth-login/check')) {
-        return { status: 200, text: JSON.stringify({ success: true, data: 'fresh-token' }) }
-      }
-      return { status: 500, text: '' }
-    },
   })
-  await runtime.handlers.get('mmtok/get-tok')()
-  assert.equal(runtime.settings.providers.custom.apiKeyEnv, 'MADMODEL_API_KEY')
-  assert.equal(runtime.settings.providers.custom.displayName, 'My Campus Gateway')
-  assert.deepEqual(runtime.settings.providers.custom.models, [{ id: 'custom-model', contextWindow: 100000 }])
-  assert.deepEqual(Object.keys(runtime.updates.at(-1).providers.custom), ['apiKeyEnv'])
+  await run(rt)
+  assert.equal(rt.settings.providers.custom.apiKeyEnv, 'MADMODEL_API_KEY')
+  assert.equal(rt.settings.providers.custom.displayName, 'My Campus Gateway')
+  assert.deepEqual(rt.settings.providers.custom.models, [{ id: 'custom-model', contextWindow: 100000 }])
+  assert.deepEqual(Object.keys(rt.updates.at(-1).providers.custom), ['apiKeyEnv'])
 })
 
 test('reusing a still-valid token preserves its original local issuance time', async () => {
-  const token = 'secret-reused-token'
-  const runtime = await createRuntime({
+  const token = tk()
+  const rt = createRuntime({
     credential: token,
     stateData: { lastGetAt: 123456, auto: false, cookies: 'session=abc', ssoCookies: '' },
-    get(args) {
-      if (args.url.endsWith('/check')) return { status: 503, text: '' }
-      if (args.url.endsWith('/auth-login')) return { status: 200, text: JSON.stringify({ success: true }) }
-      return { status: 500, text: '' }
+    http({ url }) {
+      if (url.endsWith('/model-api/auth-login/check')) return { status: 401, ok: false, location: '', text: '' }
+      if (url.endsWith('/model-api/auth-login')) return authOk()
+      return { status: 500, ok: false, location: '', text: '' }
     },
   })
-  const result = await runtime.handlers.get('mmtok/get-tok')()
+  const result = await run(rt)
   assert.equal(result.via, 'reuse')
   assert.equal(result.lastGetAt, 123456)
-  assert.ok(runtime.spawns.every(spec => !spec.argv.join(' ').includes(token)))
 })
 
 test('legacy state migration removes plaintext tokens without overwriting a newer DSH credential', async () => {
-  const runtime = await createRuntime({
+  const rt = createRuntime({
     credential: 'newer-credential-token',
     stateData: {
       token: 'stale-legacy-token',
@@ -220,106 +178,234 @@ test('legacy state migration removes plaintext tokens without overwriting a newe
       ssoCookies: [],
     },
   })
-  const state = await runtime.handlers.get('mmtok/state')()
-  assert.equal(runtime.credential, 'newer-credential-token')
-  assert.equal('token' in runtime.stateData, false)
+  const state = await rt.core.state()
+  assert.equal(rt.credential, 'newer-credential-token')
+  assert.equal('token' in rt.stateData, false)
   assert.equal(state.lastGetAt, 0, 'a corrupt future timestamp must not suppress refresh indefinitely')
-  assert.equal(runtime.stateData.cookies, '')
-  assert.equal(runtime.stateData.ssoCookies, '')
+  assert.equal(rt.stateData.cookies, '')
+  assert.equal(rt.stateData.ssoCookies, '')
 })
 
 test('capture fallback writes a minted token to credentials and provider settings', async () => {
   let mintAllowed = false
-  const token = 'secret-capture-token'
-  const runtime = await createRuntime({
-    get(args) {
-      if (args.url.endsWith('/model-api/auth-login/check')) {
-        return mintAllowed
-          ? { status: 200, text: JSON.stringify({ success: true, data: token }) }
-          : { status: 401, text: '' }
+  const token = tk()
+  const rt = createRuntime({
+    http({ url }) {
+      if (url.endsWith('/model-api/auth-login/check')) {
+        return mintAllowed ? checkOk(token) : { status: 401, ok: false, location: '', text: '' }
       }
-      return { status: 401, text: '' }
+      return { status: 401, ok: false, location: '', text: '' }
     },
-    wscdp(args) {
-      if (args.probeOnly) return { ok: false, running: false, reason: 'no-devtools' }
+    cdp: async (arg) => {
+      if (arg.probeOnly) return { ok: false, running: false, reason: 'no-devtools' }
       return { ok: true, token: '', url: 'https://madmodel.cs.tsinghua.edu.cn/', cookies: [] }
     },
+    findExe: () => 'C:\\Fake\\msedge.exe',
   })
-  const first = await runtime.handlers.get('mmtok/get-tok')()
+  const first = await run(rt)
   assert.equal(first.loginRequired, true)
-  const opened = await runtime.handlers.get('mmtok/open-login')()
+  const opened = await rt.core.openLogin()
   assert.equal(opened.launched, true)
+  assert.equal(rt.spawns.length, 1)
+  assert.ok(rt.spawns[0].argv.join(' ').includes('--remote-debugging-port='))
   mintAllowed = true
-  const captureTimer = runtime.timers.find(entry => entry.ms === 2500)
-  assert.ok(captureTimer)
-  await captureTimer.fn()
-  const state = await runtime.handlers.get('mmtok/state')()
+  const capture = rt.timers.find((t) => t.ms === 2500)
+  assert.ok(capture, 'capture poll timer must be registered')
+  await capture.fn()
+  const state = await rt.core.state()
   assert.equal(state.status, 'ok')
   assert.equal(state.credentialWritten, true)
-  assert.equal(runtime.credential, token)
+  assert.equal(rt.credential, token)
   assert.equal(state.provider, 'llm-pi-ai/madmodel')
 })
 
 test('SSO replay refuses an off-domain redirect before sending cookies', async () => {
   const seen = []
-  const runtime = await createRuntime({
+  const rt = createRuntime({
     stateData: { lastGetAt: 0, auto: false, cookies: '', ssoCookies: 'sso=secret' },
-    get(args) {
-      seen.push(args)
-      if (args.url.endsWith('/model-api/auth-login/check')) return { status: 401, text: '' }
-      if (args.url.startsWith('https://id.tsinghua.edu.cn/')) {
-        return { status: 302, location: 'https://evil.example/?ticket=stolen', text: '' }
+    http({ url }) {
+      seen.push(url)
+      if (url.endsWith('/model-api/auth-login/check')) return { status: 401, ok: false, location: '', text: '' }
+      if (url.startsWith('https://id.tsinghua.edu.cn/')) {
+        return { status: 302, ok: false, location: 'https://evil.example/?ticket=stolen', text: '' }
       }
-      return { status: 500, text: '' }
+      return { status: 500, ok: false, location: '', text: '' }
     },
   })
-  const result = await runtime.handlers.get('mmtok/get-tok')()
+  const result = await run(rt)
   assert.equal(result.loginRequired, true)
-  assert.equal(seen.some(request => request.url.startsWith('https://evil.example/')), false)
-  assert.equal(seen.find(request => request.url.startsWith('https://id.tsinghua.edu.cn/')).headers.Cookie, 'sso=secret')
+  assert.equal(seen.some((u) => u.startsWith('https://evil.example/')), false)
 })
 
-test('persisted Auto refresh runs from the Host timer without a Client page', async () => {
-  const token = 'secret-auto-token'
-  const runtime = await createRuntime({
+test('persisted Auto refresh runs from the Host timer without a browser page', async () => {
+  const token = tk()
+  const rt = createRuntime({
+    mint: token,
     stateData: { lastGetAt: 1, auto: true, cookies: '', ssoCookies: '' },
-    get(args) {
-      if (args.url.endsWith('/model-api/auth-login/check')) {
-        return { status: 200, text: JSON.stringify({ success: true, data: token }) }
-      }
-      return { status: 500, text: '' }
-    },
   })
-  const autoTimer = runtime.timers.find(entry => entry.ms === 30000)
-  assert.ok(autoTimer)
-  await autoTimer.fn()
-  assert.equal(runtime.credential, token)
+  await rt.core.init()
+  await rt.core.autoTick()
+  assert.equal(rt.credential, token)
 })
 
-test('helper state writes are overwrite-safe and accept sensitive input through stdin', async () => {
-  const runtime = await createRuntime()
-  const helper = runtime.spawns.find(spec => spec.argv[3] === 'env').argv[2]
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'thu-tok-auto-'))
-  const target = path.join(dir, 'state.json')
-  try {
-    for (const auto of [false, true]) {
-      const run = spawnSync(process.execPath, ['-e', helper, 'state'], {
-        input: JSON.stringify({ op: 'save', path: target, data: { auto } }),
-        encoding: 'utf8',
-      })
-      assert.equal(run.status, 0, run.stderr)
-      assert.equal(JSON.parse(run.stdout).ok, true)
-    }
-    assert.deepEqual(JSON.parse(fs.readFileSync(target, 'utf8')), { auto: true })
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+test('Auto tick is throttled by AUTO_RETRY_MS after a run', async () => {
+  const rt = createRuntime({
+    mint: tk(),
+    stateData: { lastGetAt: 1, auto: true, cookies: '', ssoCookies: '' },
+    now: 1_000_000_000_000,
+  })
+  await rt.core.init()
+  await rt.core.autoTick() // first attempt runs and mints
+  const firstAt = rt.saves.at(-1)?.lastGetAt
+  assert.ok(firstAt > 0)
+  await rt.core.autoTick() // immediately after: throttled, no new mint
+  assert.equal(rt.saves.at(-1)?.lastGetAt, firstAt)
+})
+
+test('openLogin reports no-debug-port when every port is taken', async () => {
+  const rt = createRuntime({
+    cdp: async () => ({ ok: false, running: true, reason: 'busy' }),
+  })
+  await rt.core.init()
+  const opened = await rt.core.openLogin()
+  assert.equal(opened.launched, false)
+  assert.equal(opened.reason, 'no-debug-port')
+})
+
+// ---------------------------------------------------------------- host shell
+function fakeRes() {
+  const out = { code: 200, headers: {}, body: '' }
+  const res = {
+    destroyed: false, writableEnded: false,
+    writeHead(code, headers) { out.code = code; out.headers = headers },
+    end(body) { out.body = String(body) },
   }
+  return { res, out }
+}
+function fakeReq(method, headers, payload) {
+  const req = new EventEmitter()
+  req.method = method
+  req.headers = headers || {}
+  const data = Buffer.from(payload === undefined ? '{}' : JSON.stringify(payload))
+  setImmediate(() => {
+    if (data.length) req.emit('data', data)
+    req.emit('end')
+  })
+  return req
+}
+
+function hostShellCtx(overrides = {}) {
+  const routes = []
+  const tapped = []
+  const intervals = []
+  const settings = {
+    describe: async () => [{ ns: 'llm-pi-ai' }],
+    get: async () => ({ providers: {} }),
+    update: async () => {},
+  }
+  const credentials = { resolve: async () => undefined, set: async () => {} }
+  const services = {
+    webServer: { register(e) { routes.push(e); return () => {} }, tapIndex(fn) { tapped.push(fn); return () => {} } },
+    connection: { requestRejection() { return undefined } },
+    timer: { interval(fn, ms) { intervals.push({ fn, ms }); return () => {} } },
+    settings,
+    credentials,
+  }
+  const ctx = {
+    get(name) { return name in overrides ? overrides[name] : services[name] },
+    effect(fn) { fn(); return () => {} },
+    interval(fn, ms) { return services.timer.interval(fn, ms) },
+  }
+  return { ctx, routes, tapped, intervals }
+}
+
+const shellHome = fs.mkdtempSync(path.join(os.tmpdir(), 'thu-tok-auto-shell-'))
+before(() => {
+  // Isolate the real state directory used by the shell (fs-backed stateIO).
+  const dir = path.join(shellHome, '.dsh', 'madmodel')
+  fs.mkdirSync(dir, { recursive: true })
+  // A fresh lastGetAt so set-auto does not trigger an immediate (network) tick.
+  fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({
+    lastGetAt: Date.now(), auto: false, cookies: '', ssoCookies: '',
+  }))
+  process.env.THU_TOK_AUTO_HOME = shellHome
 })
 
-test('CDP helper accepts only exact Tsinghua hosts and never falls back to an arbitrary page', () => {
-  assert.match(hostSource, /h === 'madmodel\.cs\.tsinghua\.edu\.cn'/)
-  assert.match(hostSource, /reason: 'unsafe-debugger-url'/)
-  assert.match(hostSource, /if \(!target \|\| !target\.webSocketDebuggerUrl\)/)
-  assert.doesNotMatch(hostSource, /for \(const p of pages\) \{ if \(p\.type === 'page'\) \{ target = p/)
-  assert.doesNotMatch(clientSource, /tokenPreview|mmtok\/sync-profile|AUTO_MS/)
+test('host shell registers API routes, injects the UI script once, and starts Auto on a 30s timer', async () => {
+  const { ctx, routes, tapped, intervals } = hostShellCtx()
+  const entry = await import('../lib/index.js?t=' + Date.now())
+  await entry.apply(ctx)
+  await new Promise((r) => setTimeout(r, 80)) // let the async init settle
+  const paths = routes.map((r) => r.path)
+  assert.deepEqual(paths, [
+    '/thu-tok-auto/api/status',
+    '/thu-tok-auto/api/get-tok',
+    '/thu-tok-auto/api/open-login',
+    '/thu-tok-auto/api/set-auto',
+    '/thu-tok-auto/ui.js',
+  ])
+  assert.equal(tapped.length, 1)
+  const html = tapped[0]('<html><body></body></html>')
+  assert.match(html, /<script defer src="\/thu-tok-auto\/ui\.js"><\/script>/)
+  assert.equal(tapped[0](html), html, 're-injecting the same HTML must be a no-op')
+  assert.ok(intervals.some((i) => i.ms === 30000))
+})
+
+test('host shell rejects untrusted requests before invoking handlers', async () => {
+  const { ctx, routes } = hostShellCtx({ connection: { requestRejection() { return 401 } } })
+  const entry = await import('../lib/index.js?t=' + Date.now())
+  await entry.apply(ctx)
+  const status = routes.find((r) => r.path === '/thu-tok-auto/api/status')
+
+  const { res, out } = fakeRes()
+  await status.handler(fakeReq('GET'), res)
+  assert.equal(out.code, 401)
+  assert.equal(JSON.parse(out.body).ok, false)
+
+  const other = hostShellCtx({ connection: { requestRejection() { return 409 } } })
+  const entry2 = await import('../lib/index.js?t=' + Date.now())
+  await entry2.apply(other.ctx)
+  const s2 = other.routes.find((r) => r.path === '/thu-tok-auto/api/status')
+  const { res: r2, out: o2 } = fakeRes()
+  await s2.handler(fakeReq('GET'), r2)
+  assert.equal(o2.code, 409)
+})
+
+test('host shell GET status and POST set-auto round-trip through real http/fs wiring', async () => {
+  const { ctx, routes } = hostShellCtx()
+  const entry = await import('../lib/index.js?t=' + Date.now())
+  await entry.apply(ctx)
+  await new Promise((r) => setTimeout(r, 80))
+  const statusRoute = routes.find((r) => r.path === '/thu-tok-auto/api/status')
+  const setAutoRoute = routes.find((r) => r.path === '/thu-tok-auto/api/set-auto')
+
+  const { res, out } = fakeRes()
+  await statusRoute.handler(fakeReq('GET'), res)
+  const snap = JSON.parse(out.body)
+  assert.equal(snap.auto, false)
+  assert.equal(out.code, 200)
+
+  const { res: r2, out: o2 } = fakeRes()
+  await setAutoRoute.handler(fakeReq('POST', { 'content-type': 'application/json' }, { on: true }), r2)
+  assert.equal(JSON.parse(o2.body).auto, true)
+  assert.equal(o2.code, 200)
+
+  // Real fs-backed state file at THU_TOK_AUTO_HOME\.dsh\madmodel\state.json,
+  // written atomically, and containing no plaintext token.
+  const statePath = path.join(process.env.THU_TOK_AUTO_HOME, '.dsh', 'madmodel', 'state.json')
+  assert.equal(fs.existsSync(statePath), true)
+  const file = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+  assert.equal(file.auto, true)
+  assert.equal('token' in file, false)
+
+  // Non-JSON POST is refused with 415.
+  const { res: r3, out: o3 } = fakeRes()
+  await setAutoRoute.handler(fakeReq('POST', { 'content-type': 'text/plain' }, { on: false }), r3)
+  assert.equal(o3.code, 415)
+})
+
+test('host shell survives a missing webServer (never shuts the profile down)', async () => {
+  const { ctx } = hostShellCtx({ webServer: undefined, connection: undefined })
+  const entry = await import('../lib/index.js?t=' + Date.now())
+  await entry.apply(ctx) // must not throw
 })

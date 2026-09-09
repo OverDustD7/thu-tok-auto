@@ -1,0 +1,6 @@
+# thu-tok-auto bundle patch: mount the plugin row into the profile composition.
+# Applied when the package is listed in the profile's dsh.profile.bundles
+# (e.g. via  dsh plugin --profile <name> add thu-tok-auto).
+- insert:
+    - id: thu-tok-auto
+      name: 'thu-tok-auto'
