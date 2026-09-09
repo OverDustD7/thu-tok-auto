@@ -1,0 +1,30 @@
+{
+  "name": "thu-tok-auto",
+  "version": "0.2.0",
+  "description": "Get / auto-refresh THU MadModel (madmodel.cs.tsinghua.edu.cn) API tokens and write them straight into the DSH model provider config (credential MADMODEL_API_KEY).",
+  "type": "module",
+  "files": [
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node test/check.mjs",
+    "test": "node --test test/*.test.mjs",
+    "prepack": "npm run check && npm test"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "thu",
+    "tsinghua",
+    "madmodel",
+    "token",
+    "auto-refresh",
+    "cordis-plugin"
+  ],
+  "license": "MIT"
+}
