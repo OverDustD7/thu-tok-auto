@@ -41,7 +41,12 @@ function createRuntime(options = {}) {
     logger: { error() {}, log() {} },
     http,
     cdp,
-    env: { home: options.home || 'C:\\Users\\test', temp: 'C:\\Temp', cwd: 'C:\\work' },
+    env: {
+      home: options.home || 'C:\\Users\\test',
+      temp: 'C:\\Temp',
+      localAppData: options.localAppData || '',
+      cwd: 'C:\\work',
+    },
     clock: { now: () => (options.now !== undefined ? options.now : Date.now()) },
     stateIO: {
       async mkdir(p) { return { ok: true } },
@@ -71,7 +76,7 @@ function createRuntime(options = {}) {
       async set(_ref, value) { credential = value },
     },
     findExecutable: async (c) => (options.findExe !== undefined ? options.findExe(c) : c),
-    spawnBrowser: async (exe, argv) => { spawns.push({ exe, argv }); return { pid: 4321 } },
+    spawnBrowser: options.spawnBrowser || (async (exe, argv) => { spawns.push({ exe, argv }); return { pid: 4321 } }),
     timer: {
       interval(fn, ms) {
         const entry = { fn, ms, disposed: false }
@@ -149,6 +154,7 @@ test('an existing MadModel route keeps user-owned fields and only receives the c
   assert.equal(rt.settings.providers.custom.displayName, 'My Campus Gateway')
   assert.deepEqual(rt.settings.providers.custom.models, [{ id: 'custom-model', contextWindow: 100000 }])
   assert.deepEqual(Object.keys(rt.updates.at(-1).providers.custom), ['apiKeyEnv'])
+  assert.equal((await rt.core.state()).providerName, 'My Campus Gateway')
 })
 
 test('reusing a still-valid token preserves its original local issuance time', async () => {
@@ -165,6 +171,16 @@ test('reusing a still-valid token preserves its original local issuance time', a
   const result = await run(rt)
   assert.equal(result.via, 'reuse')
   assert.equal(result.lastGetAt, 123456)
+})
+
+test('a non-MadModel provider using the madmodel key is never overwritten', async () => {
+  const original = { displayName: 'Other service', baseURL: 'https://example.invalid/v1', apiKeyEnv: 'OTHER_KEY' }
+  const rt = createRuntime({ mint: tk(), providers: { madmodel: original } })
+  const result = await run(rt)
+  assert.equal(result.status, 'error')
+  assert.match(result.err, /已被其他配置占用/)
+  assert.deepEqual(rt.settings.providers.madmodel, original)
+  assert.equal(rt.updates.length, 0)
 })
 
 test('legacy state migration removes plaintext tokens without overwriting a newer DSH credential', async () => {
@@ -217,6 +233,7 @@ test('capture fallback writes a minted token to credentials and provider setting
   assert.equal(state.credentialWritten, true)
   assert.equal(rt.credential, token)
   assert.equal(state.provider, 'llm-pi-ai/madmodel')
+  assert.equal(state.providerName, 'DeepSeek (THU)')
 })
 
 test('SSO replay refuses an off-domain redirect before sending cookies', async () => {
@@ -235,6 +252,29 @@ test('SSO replay refuses an off-domain redirect before sending cookies', async (
   const result = await run(rt)
   assert.equal(result.loginRequired, true)
   assert.equal(seen.some((u) => u.startsWith('https://evil.example/')), false)
+})
+
+test('SSO replay resolves query-only redirects without changing the callback path', async () => {
+  const expectedPath = '/do/off/ui/auth/login/form/d736f067a6705ab942df52f958a0f23b/0'
+  const rt = createRuntime({
+    stateData: { lastGetAt: 0, auto: false, cookies: '', ssoCookies: 'sso=secret' },
+    http({ url }) {
+      if (url.endsWith('/model-api/auth-login/check')) return { status: 401, ok: false, location: '', text: '' }
+      if (url.includes('/model-api/auth-login/check?ticket=relative-ticket')) return checkOk('sso-token')
+      const parsed = new URL(url)
+      if (parsed.hostname === 'id.tsinghua.edu.cn' && parsed.search !== '?ticket=relative-ticket') {
+        return { status: 302, ok: false, location: '?ticket=relative-ticket', text: '' }
+      }
+      if (parsed.hostname === 'id.tsinghua.edu.cn') {
+        assert.equal(parsed.pathname, expectedPath)
+        return { status: 200, ok: true, location: '', text: '' }
+      }
+      return { status: 500, ok: false, location: '', text: '' }
+    },
+  })
+  const result = await run(rt)
+  assert.equal(result.via, 'sso')
+  assert.equal(rt.credential, 'sso-token')
 })
 
 test('persisted Auto refresh runs from the Host timer without a browser page', async () => {
@@ -272,6 +312,47 @@ test('openLogin reports no-debug-port when every port is taken', async () => {
   assert.equal(opened.reason, 'no-debug-port')
 })
 
+test('openLogin recognizes a per-user browser install and reports spawn failures', async () => {
+  const local = 'C:\\Users\\test\\AppData\\Local'
+  let chosen = ''
+  const rt = createRuntime({
+    localAppData: local,
+    findExe: (candidate) => candidate === local + '\\Google\\Chrome\\Application\\chrome.exe' ? candidate : null,
+    spawnBrowser: async (exe) => {
+      chosen = exe
+      throw new Error('spawn failed')
+    },
+  })
+  await rt.core.init()
+  const opened = await rt.core.openLogin()
+  assert.equal(chosen, local + '\\Google\\Chrome\\Application\\chrome.exe')
+  assert.equal(opened.launched, false)
+  assert.equal(opened.reason, 'error')
+  assert.equal((await rt.core.state()).browserOpen, false)
+})
+
+test('disposing the core stops capture and prevents stale timer callbacks', async () => {
+  let cdpCalls = 0
+  const rt = createRuntime({
+    cdp: async (arg) => {
+      cdpCalls++
+      if (arg.probeOnly) return { ok: false, running: false, reason: 'no-devtools' }
+      return { ok: true, token: '', url: '', cookies: [] }
+    },
+    findExe: () => 'C:\\Fake\\msedge.exe',
+  })
+  await rt.core.init()
+  await rt.core.openLogin()
+  const capture = rt.timers.find((t) => t.ms === 2500)
+  assert.ok(capture)
+  const callsBeforeDispose = cdpCalls
+  rt.core.dispose()
+  assert.equal(capture.disposed, true)
+  await capture.fn()
+  assert.equal(cdpCalls, callsBeforeDispose)
+  assert.equal((await rt.core.state()).browserOpen, false)
+})
+
 // ---------------------------------------------------------------- host shell
 function fakeRes() {
   const out = { code: 200, headers: {}, body: '' }
@@ -286,7 +367,21 @@ function fakeReq(method, headers, payload) {
   const req = new EventEmitter()
   req.method = method
   req.headers = headers || {}
+  req.resume = () => {}
   const data = Buffer.from(payload === undefined ? '{}' : JSON.stringify(payload))
+  setImmediate(() => {
+    if (data.length) req.emit('data', data)
+    req.emit('end')
+  })
+  return req
+}
+
+function fakeRawReq(method, headers, payload) {
+  const req = new EventEmitter()
+  req.method = method
+  req.headers = headers || {}
+  req.resume = () => {}
+  const data = Buffer.from(payload || '')
   setImmediate(() => {
     if (data.length) req.emit('data', data)
     req.emit('end')
@@ -296,8 +391,9 @@ function fakeReq(method, headers, payload) {
 
 function hostShellCtx(overrides = {}) {
   const routes = []
-  const tapped = []
+  const indexListeners = []
   const intervals = []
+  const effects = []
   const settings = {
     describe: async () => [{ ns: 'llm-pi-ai' }],
     get: async () => ({ providers: {} }),
@@ -305,18 +401,42 @@ function hostShellCtx(overrides = {}) {
   }
   const credentials = { resolve: async () => undefined, set: async () => {} }
   const services = {
-    webServer: { register(e) { routes.push(e); return () => {} }, tapIndex(fn) { tapped.push(fn); return () => {} } },
+    webServer: {
+      register(e) {
+        e.disposed = false
+        routes.push(e)
+        return () => { e.disposed = true }
+      },
+    },
     connection: { requestRejection() { return undefined } },
-    timer: { interval(fn, ms) { intervals.push({ fn, ms }); return () => {} } },
+    timer: {
+      interval(fn, ms) {
+        const entry = { fn, ms, disposed: false }
+        intervals.push(entry)
+        return () => { entry.disposed = true }
+      },
+    },
     settings,
     credentials,
   }
   const ctx = {
     get(name) { return name in overrides ? overrides[name] : services[name] },
-    effect(fn) { fn(); return () => {} },
+    effect(fn) {
+      const cleanup = fn()
+      if (typeof cleanup === 'function') effects.push(cleanup)
+      return () => {}
+    },
+    on(name, fn) {
+      assert.equal(name, 'webserver/index-inject')
+      indexListeners.push(fn)
+      return () => {
+        const at = indexListeners.indexOf(fn)
+        if (at >= 0) indexListeners.splice(at, 1)
+      }
+    },
     interval(fn, ms) { return services.timer.interval(fn, ms) },
   }
-  return { ctx, routes, tapped, intervals }
+  return { ctx, routes, indexListeners, intervals, effects }
 }
 
 const shellHome = fs.mkdtempSync(path.join(os.tmpdir(), 'thu-tok-auto-shell-'))
@@ -332,7 +452,7 @@ before(() => {
 })
 
 test('host shell registers API routes, injects the UI script once, and starts Auto on a 30s timer', async () => {
-  const { ctx, routes, tapped, intervals } = hostShellCtx()
+  const { ctx, routes, indexListeners, intervals, effects } = hostShellCtx()
   const entry = await import('../lib/index.js?t=' + Date.now())
   await entry.apply(ctx)
   await new Promise((r) => setTimeout(r, 80)) // let the async init settle
@@ -344,11 +464,17 @@ test('host shell registers API routes, injects the UI script once, and starts Au
     '/thu-tok-auto/api/set-auto',
     '/thu-tok-auto/ui.js',
   ])
-  assert.equal(tapped.length, 1)
-  const html = tapped[0]('<html><body></body></html>')
-  assert.match(html, /<script defer src="\/thu-tok-auto\/ui\.js"><\/script>/)
-  assert.equal(tapped[0](html), html, 're-injecting the same HTML must be a no-op')
-  assert.ok(intervals.some((i) => i.ms === 30000))
+  assert.equal(indexListeners.length, 1)
+  const table = []
+  indexListeners[0](table)
+  assert.deepEqual(table, [{ kind: 'script-src', placement: 'body', src: '/thu-tok-auto/ui.js' }])
+  const autoTimer = intervals.find((i) => i.ms === 30000)
+  assert.ok(autoTimer)
+  assert.equal(effects.length, 1)
+  effects[0]()
+  assert.equal(autoTimer.disposed, true)
+  assert.equal(routes.every((r) => r.disposed), true)
+  assert.equal(indexListeners.length, 0)
 })
 
 test('host shell rejects untrusted requests before invoking handlers', async () => {
@@ -368,7 +494,23 @@ test('host shell rejects untrusted requests before invoking handlers', async () 
   const s2 = other.routes.find((r) => r.path === '/thu-tok-auto/api/status')
   const { res: r2, out: o2 } = fakeRes()
   await s2.handler(fakeReq('GET'), r2)
-  assert.equal(o2.code, 409)
+  assert.equal(o2.code, 403, 'unexpected rejection codes must be normalized to a safe denial')
+})
+
+test('host shell fails closed when the DSH trust checker throws', async () => {
+  const originalError = console.error
+  console.error = () => {}
+  try {
+    const { ctx, routes } = hostShellCtx({ connection: { requestRejection() { throw new Error('trust unavailable') } } })
+    const entry = await import('../lib/index.js?t=' + Date.now())
+    await entry.apply(ctx)
+    const status = routes.find((r) => r.path === '/thu-tok-auto/api/status')
+    const { res, out } = fakeRes()
+    await status.handler(fakeReq('GET'), res)
+    assert.equal(out.code, 403)
+  } finally {
+    console.error = originalError
+  }
 })
 
 test('host shell GET status and POST set-auto round-trip through real http/fs wiring', async () => {
@@ -402,6 +544,24 @@ test('host shell GET status and POST set-auto round-trip through real http/fs wi
   const { res: r3, out: o3 } = fakeRes()
   await setAutoRoute.handler(fakeReq('POST', { 'content-type': 'text/plain' }, { on: false }), r3)
   assert.equal(o3.code, 415)
+
+  // Invalid JSON, invalid field types and oversized bodies have specific 4xx responses.
+  const { res: r4, out: o4 } = fakeRes()
+  await setAutoRoute.handler(fakeRawReq('POST', { 'content-type': 'application/json' }, '{'), r4)
+  assert.equal(o4.code, 400)
+
+  const { res: r5, out: o5 } = fakeRes()
+  await setAutoRoute.handler(fakeReq('POST', { 'content-type': 'application/json' }, { on: 'true' }), r5)
+  assert.equal(o5.code, 400)
+
+  const { res: r6, out: o6 } = fakeRes()
+  await setAutoRoute.handler(fakeRawReq('POST', { 'content-type': 'application/json' }, 'x'.repeat(70 * 1024)), r6)
+  assert.equal(o6.code, 413)
+
+  const { res: r7, out: o7 } = fakeRes()
+  await statusRoute.handler(fakeReq('POST'), r7)
+  assert.equal(o7.code, 405)
+  assert.equal(o7.headers.Allow, 'GET')
 })
 
 test('host shell survives a missing webServer (never shuts the profile down)', async () => {
