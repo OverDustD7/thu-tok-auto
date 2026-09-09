@@ -1,6 +1,6 @@
 {
   "name": "thu-tok-auto",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Get / auto-refresh THU MadModel (madmodel.cs.tsinghua.edu.cn) API tokens and write them straight into the DSH model provider config (credential MADMODEL_API_KEY). Installs as a DSH profile bundle (Cordis plugin).",
   "type": "module",
   "main": "lib/index.js",

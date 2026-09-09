@@ -33,7 +33,11 @@ if (!pkg.dsh || !pkg.dsh.bundle || pkg.dsh.bundle.patch !== './cordis.patch.yml'
 if (!pkg.files || !pkg.files.includes('cordis.patch.yml')) throw new Error('cordis.patch.yml must ship in files')
 
 const ui = fs.readFileSync('lib/ui.js', 'utf8')
-if (!ui.includes('mmtok-auto-on')) throw new Error('ui.js missing auto-on style')
+if (!ui.includes('mmtok-auto-active')) throw new Error('ui.js missing auto-active style')
 if (!ui.includes('/thu-tok-auto/api')) throw new Error('ui.js missing API base')
+if (!ui.includes('findSettingsTrigger')) throw new Error('ui.js missing settings-trigger lookup')
+if (!ui.includes('footAreaOf')) throw new Error('ui.js missing foot-area lookup')
+if (!ui.includes('insertBefore(box, foot.firstChild)')) throw new Error('ui.js must mount above existing footer buttons')
+if (ui.includes('position:fixed')) throw new Error('ui.js must not pin the widget to a fixed screen position')
 
 console.log('Bundle form checks: OK')
