@@ -50,4 +50,10 @@ if (!entry.includes("ctx.on('webserver/index-inject'")) throw new Error('index.j
 if (entry.includes('webServer.tapIndex(')) throw new Error('index.js must not use the served-page-only tapIndex escape hatch')
 if (!entry.includes('disposers.push(() => core.dispose())')) throw new Error('index.js must dispose the core lifecycle')
 
+// Model list must follow the site, not a frozen id that the site has retired.
+const core = fs.readFileSync('lib/core.js', 'utf8')
+if (core.includes('DeepSeek-V4-Flash-0731')) throw new Error('core.js must not keep the model id the site retired')
+if (!core.includes('export function extractModelList')) throw new Error('core.js must parse the model list out of the site bundle')
+if (!core.includes('EXCLUDED_MODEL_IDS')) throw new Error('core.js must keep the excluded-model list')
+
 console.log('Bundle form checks: OK')

@@ -7,7 +7,7 @@ DSH / DeepSeek Harness 的 Cordis 插件：一键获取清华大学 MadModel 平
 - **Get**：立即获取最新 token（校园网内免登录签发，实测无需任何账号/密码），
   写入 DSH 凭据 `MADMODEL_API_KEY` 并自动创建/复用模型 Provider
   `llm-pi-ai.providers.madmodel`（baseURL 指向 madmodel）。
-- **Auto**：开关自动续期。开启后计时超过 **05:50** 自动触发 Get，
+- **Auto**：开关自动续期。开启后每满 **1 小时**自动触发一次 Get，
   自动任务运行在 Host 侧，与页面是否打开无关。
 - **计时器**：显示「距最近一次 Get 的本地经过时间」`hh:mm`；
   达到 100 小时后显示 `Too Long!`（表示该去管管了）。
@@ -62,9 +62,26 @@ dsh plugin --profile web up thu-tok-auto
 - DSH 凭据：`credentials.set('MADMODEL_API_KEY', token)`
 - DSH 模型配置：查找 baseURL 含 `madmodel.cs.tsinghua.edu.cn` 的 Provider；
   不存在则自动创建 `llm-pi-ai.providers.madmodel`
-  （`api: openai-completions`、`apiKeyEnv: MADMODEL_API_KEY`，模型
-  `DeepSeek-V4-Flash-0731`）。插件只写目标 Provider，不会把其他 Provider
-  复制成用户层覆盖。
+  （`api: openai-completions`、`apiKeyEnv: MADMODEL_API_KEY`）。插件只写目标
+  Provider，不会把其他 Provider 复制成用户层覆盖。
+
+### 模型列表跟着站点走
+
+站点的模型会改名、下架、换档位（2026-09 就把 `DeepSeek-V4-Flash-0731` 换成了
+`DeepSeek-V4.1-Flash`，旧名字现在请求直接返回"模型不存在"）。插件不写死这份名单：
+
+- 每次 Get / Auto 签发后，从站点自己的前端包里读它正在用的模型列表
+  （站点没有模型列表接口，`/v1/models` 会落回 SPA），转成 provider 的 `models`
+  写进去；列表与现有配置一致时不写盘。结果缓存 6 小时，避免每次重复下载几 MB 的包。
+- 读不到时回退到代码内置的名单，功能不受影响。
+- 排除名单（`EXCLUDED_MODEL_IDS`）：`DeepSeek-V4-Flash-Vision-Exp`（V4.1-Flash
+  已覆盖图片输入）与 `DeepSeek-R1-W8A8`。
+- 注意：既然名单跟着站点走，**手动往 provider 里加的模型会在下一次签到时被同步覆盖**；
+  要长期保留请加进代码里的名单。
+- `contextWindow` 统一写 150000，依据是网关的请求体上限而不是模型上限：madmodel
+  前面的 nginx 是 `client_max_body_size 1m`，1 MiB 请求体折合约 15–17 万 token
+  （实测 148,442 token 通过、200,000 被 413 拒绝）。写得比这更大，历史涨上来时
+  整个请求会被网关拒掉（413，不是截断）。
 
 ### 时间语义（实测数据）
 
@@ -75,8 +92,9 @@ dsh plugin --profile web up thu-tok-auto
 - 旧 token 仅通过有效性校验而被复用时，不会重置 `lastGetAt`，避免把剩余寿命
   错算成新的 6 小时。
 - 显示剩余 = `lastGetAt + 6h − now`；计时 = `now − lastGetAt`。
-- **Auto 间隔 05:50**：仅对假定的 6h 寿命保留 10 分钟缓冲；若实际签发的是
-  5h token，此间隔不能保证到期前续期。剩余时间是本地估算，须以服务端校验为准。
+- **Auto 间隔 1 小时**：不按 token 寿命卡点，每满 1 小时重新签发一次（校园网签发
+  免费）。假定 6h 寿命只是 JWT 解码结果、不是站点的保证，所以固定间隔比精确卡点
+  更稳。剩余时间是本地估算，须以服务端校验为准。
 - 计时从未获取过/无基准时显示 `--:--`；超过 99:59 显示 `Too Long!`。
 
 ## 平台限制（重要）

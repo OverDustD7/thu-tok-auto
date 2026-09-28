@@ -5,7 +5,7 @@ import path from 'node:path'
 import vm from 'node:vm'
 import { EventEmitter } from 'node:events'
 import { test, before } from 'node:test'
-import { createCore, AUTO_REFRESH_MS, AUTO_RETRY_MS, CRED_REF } from '../lib/core.js'
+import { createCore, extractModelList, toProviderModels, AUTO_REFRESH_MS, AUTO_RETRY_MS, CRED_REF } from '../lib/core.js'
 
 const tk = () => 't' + Math.random().toString(36).slice(2) + 'k'
 
@@ -94,6 +94,27 @@ function createRuntime(options = {}) {
 
 const checkOk = (token) => okResponse({ success: true, data: token })
 
+// What the plugin registers when the site's own list cannot be read.
+const FALLBACK_MODELS = [
+  {
+    id: 'DeepSeek-V4.1-Flash',
+    name: 'DeepSeek-V4.1-Flash (THU)',
+    contextWindow: 150000,
+    input: ['text', 'image'],
+    reasoningEfforts: { low: 'low', high: 'high', max: 'max' },
+  },
+  {
+    id: 'qwen3.8-27b',
+    name: 'qwen3.8-27b (THU)',
+    contextWindow: 150000,
+    input: ['text', 'image'],
+    reasoningEfforts: { low: 'low', medium: 'medium', xhigh: 'xhigh' },
+  },
+]
+
+// Verbatim shape of the site's own front-end bundle (minified the same way).
+const SITE_BUNDLE = 'var x=1;const W0={modelList:[{label:"DeepSeek-V4.1-Flash",value:"DeepSeek-V4.1-Flash",max_tokens:3,supportImage:!1,thinkingParam:"thinking",thinkingField:"reasoning_content",effortOptions:["low","high","max"]},{label:"DeepSeek-V4-Flash-Vision-Exp",value:"DeepSeek-V4-Flash-Vision-Exp",max_tokens:3,supportImage:!0,thinkingParam:"thinking",thinkingField:"reasoning_content",effortOptions:["low","medium","xhigh"]},{label:"qwen3.8-27b",value:"qwen3.8-27b",max_tokens:3,supportImage:!0,thinkingParam:"enable_thinking",thinkingField:"reasoning",effortOptions:["low","medium","xhigh"]},{label:"DeepSeek-R1-W8A8",value:"DeepSeek-R1-W8A8",max_tokens:3,supportImage:!1,thinkingParam:null,thinkingField:"content",effortOptions:["low","medium","high"]}]},after=2;'
+
 const run = async (rt) => {
   await rt.core.init()
   return rt.core.getTok()
@@ -123,12 +144,7 @@ test('fresh mint creates a valid minimal llm-pi-ai route without exposing the to
     api: 'openai-completions',
     reasoning: 'medium',
     baseURL: 'https://madmodel.cs.tsinghua.edu.cn/v1',
-    models: [{
-      id: 'DeepSeek-V4-Flash-0731',
-      name: 'DeepSeek-V4-Flash (THU)',
-      contextWindow: 150000,
-      reasoningEfforts: { minimal: 'none', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
-    }],
+    models: FALLBACK_MODELS,
   })
   assert.deepEqual(Object.keys(rt.updates.at(-1).providers), ['madmodel'], 'unrelated providers must not be copied into the user layer')
   assert.equal('token' in rt.stateData, false, 'token must never enter the state file')
@@ -136,7 +152,7 @@ test('fresh mint creates a valid minimal llm-pi-ai route without exposing the to
   assert.ok(rt.saves.every((s) => !('token' in s)))
 })
 
-test('an existing MadModel route keeps user-owned fields and only receives the credential reference', async () => {
+test('an existing MadModel route gets the credential reference and the current model list', async () => {
   const rt = createRuntime({
     mint: tk(),
     providers: {
@@ -152,9 +168,67 @@ test('an existing MadModel route keeps user-owned fields and only receives the c
   await run(rt)
   assert.equal(rt.settings.providers.custom.apiKeyEnv, 'MADMODEL_API_KEY')
   assert.equal(rt.settings.providers.custom.displayName, 'My Campus Gateway')
-  assert.deepEqual(rt.settings.providers.custom.models, [{ id: 'custom-model', contextWindow: 100000 }])
-  assert.deepEqual(Object.keys(rt.updates.at(-1).providers.custom), ['apiKeyEnv'])
+  // The site retires and renames models over time; a stale list on an existing
+  // route means every request fails with "模型不存在" until someone edits YAML.
+  assert.deepEqual(rt.settings.providers.custom.models, FALLBACK_MODELS)
+  assert.deepEqual(Object.keys(rt.updates.at(-1).providers.custom), ['apiKeyEnv', 'models'])
   assert.equal((await rt.core.state()).providerName, 'My Campus Gateway')
+})
+
+test('the provider takes the model list the site itself serves, minus the excluded ones', async () => {
+  const rt = createRuntime({
+    mint: tk(),
+    http({ url }) {
+      if (url === 'https://madmodel.cs.tsinghua.edu.cn/') {
+        return okResponse('<script type="module" crossorigin src="/assets/js/index-abc.js"></script>')
+      }
+      if (url === 'https://madmodel.cs.tsinghua.edu.cn/assets/js/index-abc.js') return okResponse(SITE_BUNDLE)
+      return undefined
+    },
+  })
+  await run(rt)
+  assert.deepEqual(rt.settings.providers.madmodel.models, FALLBACK_MODELS)
+})
+
+test('a route already carrying the live list is not rewritten on every Get', async () => {
+  const rt = createRuntime({
+    mint: tk(),
+    providers: {
+      madmodel: {
+        displayName: 'DeepSeek (THU)',
+        apiKeyEnv: 'MADMODEL_API_KEY',
+        baseURL: 'https://madmodel.cs.tsinghua.edu.cn/v1',
+        models: FALLBACK_MODELS,
+      },
+    },
+  })
+  await run(rt)
+  assert.equal(rt.updates.length, 0, 'an unchanged route must not be written back')
+})
+
+test('extractModelList reads the site bundle and toProviderModels keeps only the wanted models', () => {
+  const parsed = extractModelList(SITE_BUNDLE)
+  assert.deepEqual(parsed.map((m) => m.id), [
+    'DeepSeek-V4.1-Flash',
+    'DeepSeek-V4-Flash-Vision-Exp',
+    'qwen3.8-27b',
+    'DeepSeek-R1-W8A8',
+  ])
+  assert.equal(parsed[0].supportImage, false)
+  assert.equal(parsed[1].supportImage, true)
+  assert.deepEqual(parsed[0].efforts, ['low', 'high', 'max'])
+
+  const models = toProviderModels(parsed)
+  assert.deepEqual(models.map((m) => m.id), ['DeepSeek-V4.1-Flash', 'qwen3.8-27b'])
+  // The site marks V4.1-Flash text-only, but a real request read our test image.
+  assert.deepEqual(models[0].input, ['text', 'image'])
+  assert.deepEqual(models[0].reasoningEfforts, { low: 'low', high: 'high', max: 'max' })
+  assert.deepEqual(models[1].reasoningEfforts, { low: 'low', medium: 'medium', xhigh: 'xhigh' })
+
+  assert.equal(extractModelList('nothing here'), null)
+  assert.equal(extractModelList(''), null)
+  assert.equal(toProviderModels([]), null)
+  assert.equal(toProviderModels([{ id: 'DeepSeek-R1-W8A8', efforts: ['low'] }]), null, 'an all-excluded list must not replace the fallback')
 })
 
 test('reusing a still-valid token preserves its original local issuance time', async () => {
