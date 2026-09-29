@@ -55,5 +55,8 @@ const core = fs.readFileSync('lib/core.js', 'utf8')
 if (core.includes('DeepSeek-V4-Flash-0731')) throw new Error('core.js must not keep the model id the site retired')
 if (!core.includes('export function extractModelList')) throw new Error('core.js must parse the model list out of the site bundle')
 if (!core.includes('EXCLUDED_MODEL_IDS')) throw new Error('core.js must keep the excluded-model list')
+if (!core.includes('RENEWAL_HINT')) throw new Error('core.js must explain a blocked renewal path')
+if (!core.includes('runGetTok({ manual: true })')) throw new Error('a manual Get must not be short-circuited by reuse')
+if (!ui.includes('LOGIN_REASON_TEXT')) throw new Error('ui.js must surface why a login window did not open')
 
 console.log('Bundle form checks: OK')

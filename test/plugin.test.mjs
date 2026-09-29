@@ -643,3 +643,82 @@ test('host shell survives a missing webServer (never shuts the profile down)', a
   const entry = await import('../lib/index.js?t=' + Date.now())
   await entry.apply(ctx) // must not throw
 })
+
+// --- renewal blocked (2026-09-29: the site retired anonymous mint, so a manual
+// Get that fell back to reuse looked exactly like a dead button) -------------
+
+test('a manual Get asks for a login when neither mint nor SSO can renew', async () => {
+  const token = tk()
+  const rt = createRuntime({
+    credential: token,
+    stateData: { lastGetAt: Date.now() - 60e3, auto: false, cookies: '', ssoCookies: '' },
+  })
+  await rt.core.init()
+  const res = await rt.core.getTok()
+  assert.equal(res.loginRequired, true, 'a manual Get must fall through to the login window')
+  assert.equal(res.status, 'needs-login')
+  assert.equal(res.refreshBlocked, true)
+  assert.equal(res.via, 'reuse', 'the token in hand is still the reused one')
+  assert.equal(rt.credential, token, 'the still-valid token must be kept')
+  assert.equal(rt.stateData.lastGetAt, res.lastGetAt, 'a reuse must not reset the baseline')
+  assert.equal(rt.stateData.refreshBlocked, true, 'the block must be persisted for the next start')
+})
+
+test('an Auto tick reuses a valid token but records that renewal is broken', async () => {
+  const token = tk()
+  const rt = createRuntime({
+    credential: token,
+    stateData: { lastGetAt: Date.now() - 2 * 3600e3, auto: true, cookies: '', ssoCookies: '' },
+  })
+  await rt.core.init()
+  const snap = await rt.core.autoTick()
+  assert.equal(snap.via, 'reuse', 'Auto keeps living on the valid token')
+  assert.equal(snap.refreshBlocked, true)
+  assert.equal(snap.status, 'needs-login', 'a broken renewal path must not look healthy')
+  assert.equal(snap.loginRequired, false, 'a background tick never opens a browser')
+})
+
+test('a remembered renewal block survives a reload and outranks the local clock', async () => {
+  const rt = createRuntime({
+    credential: tk(),
+    stateData: {
+      lastGetAt: Date.now() - 60e3, auto: false, cookies: '', ssoCookies: '',
+      refreshBlocked: true, loginReason: 'renewal-unavailable',
+    },
+  })
+  const snap = await rt.core.init()
+  assert.equal(snap.status, 'needs-login', 'the token is nominally fresh, but renewal is broken')
+  assert.equal(snap.refreshBlocked, true)
+  assert.equal(snap.loginReason, 'renewal-unavailable')
+})
+
+test('open-login reports and records why no window appeared', async () => {
+  const rt = createRuntime({ credential: tk(), findExe: () => false })
+  await rt.core.init()
+  const res = await rt.core.openLogin()
+  assert.equal(res.launched, false)
+  assert.equal(res.reason, 'no-browser')
+  assert.equal((await rt.core.state()).loginReason, 'no-browser')
+})
+
+test('a second open-login while one is pending says so instead of doing nothing', async () => {
+  const rt = createRuntime({ credential: tk() })
+  await rt.core.init()
+  rt.core.internal.state.browserOpen = true
+  const res = await rt.core.openLogin()
+  assert.equal(res.launched, false)
+  assert.equal(res.reason, 'already-open')
+  assert.equal((await rt.core.state()).loginReason, 'already-open')
+})
+
+test('saving an unchanged state does not rewrite the file', async () => {
+  const rt = createRuntime({
+    credential: tk(),
+    stateData: { lastGetAt: Date.now() - 60e3, auto: false, cookies: '', ssoCookies: '' },
+  })
+  await rt.core.init()
+  await rt.core.internal.saveState()
+  const afterFirst = rt.saves.length
+  await rt.core.internal.saveState()
+  assert.equal(rt.saves.length, afterFirst, 'an unchanged snapshot must not be written twice')
+})
