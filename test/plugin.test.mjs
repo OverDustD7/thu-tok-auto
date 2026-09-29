@@ -5,7 +5,7 @@ import path from 'node:path'
 import vm from 'node:vm'
 import { EventEmitter } from 'node:events'
 import { test, before } from 'node:test'
-import { createCore, extractModelList, toProviderModels, AUTO_REFRESH_MS, AUTO_RETRY_MS, CRED_REF } from '../lib/core.js'
+import { createCore, extractModelList, toProviderModels, buildCookieHeader, AUTO_REFRESH_MS, AUTO_RETRY_MS, CRED_REF } from '../lib/core.js'
 
 const tk = () => 't' + Math.random().toString(36).slice(2) + 'k'
 
@@ -331,7 +331,10 @@ test('SSO replay refuses an off-domain redirect before sending cookies', async (
 test('SSO replay resolves query-only redirects without changing the callback path', async () => {
   const expectedPath = '/do/off/ui/auth/login/form/d736f067a6705ab942df52f958a0f23b/0'
   const rt = createRuntime({
-    stateData: { lastGetAt: 0, auto: false, cookies: '', ssoCookies: 'sso=secret' },
+    stateData: {
+      lastGetAt: 0, auto: false, cookies: '', ssoCookies: 'sso=secret',
+      cookieJar: [{ name: 'JSESSIONID', value: 'secret', domain: 'id.tsinghua.edu.cn', path: '/', secure: true, expires: -1 }],
+    },
     http({ url }) {
       if (url.endsWith('/model-api/auth-login/check')) return { status: 401, ok: false, location: '', text: '' }
       if (url.includes('/model-api/auth-login/check?ticket=relative-ticket')) return checkOk('sso-token')
@@ -647,7 +650,7 @@ test('host shell survives a missing webServer (never shuts the profile down)', a
 // --- renewal blocked (2026-09-29: the site retired anonymous mint, so a manual
 // Get that fell back to reuse looked exactly like a dead button) -------------
 
-test('a manual Get asks for a login when neither mint nor SSO can renew', async () => {
+test('a Get with a usable token reuses it instead of popping a browser', async () => {
   const token = tk()
   const rt = createRuntime({
     credential: token,
@@ -655,13 +658,57 @@ test('a manual Get asks for a login when neither mint nor SSO can renew', async 
   })
   await rt.core.init()
   const res = await rt.core.getTok()
-  assert.equal(res.loginRequired, true, 'a manual Get must fall through to the login window')
-  assert.equal(res.status, 'needs-login')
-  assert.equal(res.refreshBlocked, true)
+  assert.notEqual(res.loginRequired, true, 'a working token must not force a login')
   assert.equal(res.via, 'reuse', 'the token in hand is still the reused one')
+  assert.equal(res.status, 'ok', 'a usable token keeps the widget green')
+  assert.equal(res.refreshBlocked, true, 'the broken renewal path is still recorded')
   assert.equal(rt.credential, token, 'the still-valid token must be kept')
   assert.equal(rt.stateData.lastGetAt, res.lastGetAt, 'a reuse must not reset the baseline')
-  assert.equal(rt.stateData.refreshBlocked, true, 'the block must be persisted for the next start')
+  assert.equal(rt.stateData.refreshBlocked, true, 'the note must be persisted for the next start')
+})
+
+test('a Get with no usable token is the case that asks for a login', async () => {
+  const rt = createRuntime({
+    stateData: { lastGetAt: 0, auto: false, cookies: '', ssoCookies: '' },
+  })
+  await rt.core.init()
+  const res = await rt.core.getTok()
+  assert.equal(res.loginRequired, true, 'nothing usable left: the login window is the way out')
+  assert.equal(res.status, 'needs-login')
+  assert.equal(res.via, 'none')
+})
+
+test('a browser still holding the session is used before any replay', async () => {
+  const live = tk()
+  const rt = createRuntime({
+    stateData: { lastGetAt: 0, auto: false, cookies: '', ssoCookies: '' },
+    cdp: async (arg) => (arg.probeOnly
+      ? { ok: true, running: true }
+      : { ok: true, token: live, url: 'https://madmodel.cs.tsinghua.edu.cn/', cookies: [] }),
+  })
+  await rt.core.init()
+  const res = await rt.core.getTok()
+  assert.equal(res.via, 'browser', 'the live browser session is the first renewable source')
+  assert.equal(rt.credential, live)
+})
+
+test('cookie headers follow domain, path, secure and expiry', () => {
+  const now = Date.now()
+  const jar = [
+    { name: 'a', value: '1', domain: 'id.tsinghua.edu.cn', path: '/' },
+    { name: 'b', value: '2', domain: 'tsinghua.edu.cn', path: '/do/off' },
+    { name: 'c', value: '3', domain: 'other.example', path: '/' },
+    { name: 'd', value: '4', domain: 'id.tsinghua.edu.cn', path: '/', secure: true },
+    { name: 'e', value: '5', domain: 'id.tsinghua.edu.cn', path: '/', expires: Math.floor((now - 1000) / 1000) },
+  ]
+  const header = buildCookieHeader(jar, 'https://id.tsinghua.edu.cn/do/off/ui/auth/login/form/x/0?/authLogin', now)
+  assert.ok(header.indexOf('b=2') !== -1, 'a path-scoped cookie applies to its own path')
+  assert.ok(header.indexOf('b=2') < header.indexOf('a=1'), 'longer paths come first, as browsers order them')
+  assert.equal(header.indexOf('c=3'), -1, 'other domains are excluded')
+  assert.equal(header.indexOf('e=5'), -1, 'expired cookies are dropped')
+  assert.ok(header.indexOf('d=4') !== -1, 'secure cookies are kept on https')
+  assert.equal(buildCookieHeader(jar, 'http://id.tsinghua.edu.cn/').indexOf('d=4'), -1, 'secure cookies are dropped on http')
+  assert.equal(buildCookieHeader(jar, 'not a url').indexOf('a=1'), -1, 'an unparsable target yields no header')
 })
 
 test('an Auto tick reuses a valid token but records that renewal is broken', async () => {
@@ -673,12 +720,12 @@ test('an Auto tick reuses a valid token but records that renewal is broken', asy
   await rt.core.init()
   const snap = await rt.core.autoTick()
   assert.equal(snap.via, 'reuse', 'Auto keeps living on the valid token')
-  assert.equal(snap.refreshBlocked, true)
-  assert.equal(snap.status, 'needs-login', 'a broken renewal path must not look healthy')
+  assert.equal(snap.status, 'ok', 'a usable token keeps the widget green')
+  assert.equal(snap.refreshBlocked, true, 'the broken renewal path is recorded for the hover note')
   assert.equal(snap.loginRequired, false, 'a background tick never opens a browser')
 })
 
-test('a remembered renewal block survives a reload and outranks the local clock', async () => {
+test('a remembered renewal block survives a reload without faking a warning', async () => {
   const rt = createRuntime({
     credential: tk(),
     stateData: {
@@ -687,9 +734,21 @@ test('a remembered renewal block survives a reload and outranks the local clock'
     },
   })
   const snap = await rt.core.init()
-  assert.equal(snap.status, 'needs-login', 'the token is nominally fresh, but renewal is broken')
-  assert.equal(snap.refreshBlocked, true)
+  assert.equal(snap.status, 'ok', 'a working token outranks the remembered block')
+  assert.equal(snap.refreshBlocked, true, 'the note survives the reload')
   assert.equal(snap.loginReason, 'renewal-unavailable')
+})
+
+test('a remembered block still means needs-login when there is no token at all', async () => {
+  const rt = createRuntime({
+    stateData: {
+      lastGetAt: 0, auto: false, cookies: '', ssoCookies: '',
+      refreshBlocked: true, loginReason: 'renewal-unavailable',
+    },
+  })
+  const snap = await rt.core.init()
+  assert.equal(snap.status, 'needs-login', 'nothing usable and renewal is broken')
+  assert.equal(snap.refreshBlocked, true)
 })
 
 test('open-login reports and records why no window appeared', async () => {

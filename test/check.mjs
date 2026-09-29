@@ -56,7 +56,9 @@ if (core.includes('DeepSeek-V4-Flash-0731')) throw new Error('core.js must not k
 if (!core.includes('export function extractModelList')) throw new Error('core.js must parse the model list out of the site bundle')
 if (!core.includes('EXCLUDED_MODEL_IDS')) throw new Error('core.js must keep the excluded-model list')
 if (!core.includes('RENEWAL_HINT')) throw new Error('core.js must explain a blocked renewal path')
-if (!core.includes('runGetTok({ manual: true })')) throw new Error('a manual Get must not be short-circuited by reuse')
+if (!core.includes('buildCookieHeader')) throw new Error('core.js must keep the per-URL cookie rule')
+if (!core.includes('renewFromBrowser')) throw new Error('core.js must renew from a live browser session')
+if (core.includes('ckHeader(') || core.includes('ssoHeader(')) throw new Error('core.js must not filter cookies by host at capture time')
 if (!ui.includes('LOGIN_REASON_TEXT')) throw new Error('ui.js must surface why a login window did not open')
 
 console.log('Bundle form checks: OK')
