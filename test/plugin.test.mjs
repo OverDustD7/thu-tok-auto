@@ -722,3 +722,19 @@ test('saving an unchanged state does not rewrite the file', async () => {
   await rt.core.internal.saveState()
   assert.equal(rt.saves.length, afterFirst, 'an unchanged snapshot must not be written twice')
 })
+
+test('the login window opens the Tsinghua SSO form with a debug port', async () => {
+  const rt = createRuntime({ credential: tk() })
+  await rt.core.init()
+  const res = await rt.core.openLogin()
+  assert.equal(res.launched, true)
+  assert.equal(rt.spawns.length, 1, 'exactly one browser is launched')
+  const argv = rt.spawns[0].argv
+  assert.match(
+    argv[argv.length - 1],
+    /^https:\/\/id\.tsinghua\.edu\.cn\/do\/off\/ui\/auth\/login\/form\//,
+    'must open the SSO form, not the site home page',
+  )
+  assert.ok(argv.some((a) => a.startsWith('--remote-debugging-port=')), 'the debug port is what makes the capture possible')
+  assert.ok(argv.some((a) => a.startsWith('--user-data-dir=')), 'the dedicated profile keeps the session between attempts')
+})
