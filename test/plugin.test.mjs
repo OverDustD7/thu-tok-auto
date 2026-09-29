@@ -650,7 +650,7 @@ test('host shell survives a missing webServer (never shuts the profile down)', a
 // --- renewal blocked (2026-09-29: the site retired anonymous mint, so a manual
 // Get that fell back to reuse looked exactly like a dead button) -------------
 
-test('a Get with a usable token reuses it instead of popping a browser', async () => {
+test('a click that cannot renew hands over the login window while keeping the token', async () => {
   const token = tk()
   const rt = createRuntime({
     credential: token,
@@ -658,7 +658,7 @@ test('a Get with a usable token reuses it instead of popping a browser', async (
   })
   await rt.core.init()
   const res = await rt.core.getTok()
-  assert.notEqual(res.loginRequired, true, 'a working token must not force a login')
+  assert.equal(res.loginRequired, true, 'a click that cannot renew must open the one door left')
   assert.equal(res.via, 'reuse', 'the token in hand is still the reused one')
   assert.equal(res.status, 'ok', 'a usable token keeps the widget green')
   assert.equal(res.refreshBlocked, true, 'the broken renewal path is still recorded')
