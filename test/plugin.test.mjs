@@ -47,7 +47,7 @@ function createRuntime(options = {}) {
       localAppData: options.localAppData || '',
       cwd: 'C:\\work',
     },
-    clock: { now: () => (options.now !== undefined ? options.now : Date.now()) },
+    clock: { now: options.clockNow || (() => (options.now !== undefined ? options.now : Date.now())) },
     stateIO: {
       async mkdir(p) { return { ok: true } },
       async load() { return { ok: true, data: stateData } },
@@ -851,4 +851,97 @@ test('a token the server refuses is reported instead of looking healthy', async 
   assert.equal(res.serverValid, false, 'the server verdict must be recorded')
   assert.equal(res.status, 'error')
   assert.match(String(res.err), /服务端不接受/, 'and must be visible, not swallowed')
+})
+
+test('the same token coming back again is not reported as a refresh', async () => {
+  const exp = Math.floor(Date.now() / 1000) + 6 * 3600
+  const token = jwtWith(exp)
+  const rt = createRuntime({
+    credential: token,
+    stateData: {
+      lastGetAt: Date.now() - 3600e3, auto: false, cookies: '', ssoCookies: '',
+      tokenExpAt: exp * 1000, // the record already knows this token's expiry
+    },
+    http({ url }) {
+      if (url.endsWith('/model-api/auth-login/check')) return checkOk(token) // mint hands back the same string
+      if (url.endsWith('/model-api/auth-login')) return authOk() // and it is still valid, of course
+      return { status: 500, ok: false, location: '', text: '' }
+    },
+  })
+  await rt.core.init()
+  const res = await rt.core.getTok()
+  assert.equal(res.expiryAdvanced, false, 'the expiry did not move forward')
+  assert.notEqual(res.status, 'ok', 'a re-issued identical token must not look like a successful refresh')
+  assert.match(String(res.err), /到期时间/, 'the panel has to say what actually happened')
+  assert.equal(rt.stateData.tokenExpAt, exp * 1000)
+})
+
+test('a genuinely new token advances the expiry and is reported as a refresh', async () => {
+  const oldExp = Math.floor(Date.now() / 1000) + 600
+  const newExp = oldExp + 6 * 3600
+  const rt = createRuntime({
+    credential: jwtWith(oldExp),
+    stateData: {
+      lastGetAt: Date.now() - 3600e3, auto: false, cookies: '', ssoCookies: '',
+      tokenExpAt: oldExp * 1000,
+    },
+    http({ url }) {
+      if (url.endsWith('/model-api/auth-login/check')) return checkOk(jwtWith(newExp))
+      if (url.endsWith('/model-api/auth-login')) return authOk()
+      return { status: 500, ok: false, location: '', text: '' }
+    },
+  })
+  await rt.core.init()
+  const res = await rt.core.getTok()
+  assert.equal(res.expiryAdvanced, true)
+  assert.equal(res.status, 'ok')
+  assert.equal(rt.stateData.tokenExpAt, newExp * 1000, 'the stored expiry follows the new token')
+})
+
+// --- when a background tick may open the login window ------------------------
+
+const stalledRuntime = (expSeconds, extra) => {
+  const token = jwtWith(expSeconds)
+  return (extra || {}).rt || createRuntime({
+    credential: token,
+    clockNow: (extra && extra.clockNow) || undefined,
+    stateData: {
+      lastGetAt: ((extra && extra.now) || Date.now()) - 3600e3,
+      auto: true, cookies: '', ssoCookies: '', tokenExpAt: expSeconds * 1000,
+    },
+    http({ url }) {
+      if (url.endsWith('/model-api/auth-login/check')) return { status: 401, ok: false, location: '', text: '' }
+      // the old token is still accepted, but no path can extend its life
+      if (url.endsWith('/model-api/auth-login')) return authOk()
+      return { status: 500, ok: false, location: '', text: '' }
+    },
+  })
+}
+
+test('a background tick asks for a login once the token is nearly out', async () => {
+  const rt = stalledRuntime(Math.floor(Date.now() / 1000) + 1800) // 30 minutes left
+  await rt.core.init()
+  const snap = await rt.core.autoTick()
+  assert.equal(snap.renewalNoProgress, true, 'the same token came back')
+  assert.equal(snap.loginRequired, true, 'nearly out: a background tick may open the window')
+  assert.equal(snap.nearlyOut, true)
+})
+
+test('a background tick stays quiet while hours of life remain', async () => {
+  const rt = stalledRuntime(Math.floor(Date.now() / 1000) + 5 * 3600) // 5 hours left
+  await rt.core.init()
+  const snap = await rt.core.autoTick()
+  assert.equal(snap.renewalNoProgress, true)
+  assert.notEqual(snap.loginRequired, true, 'plenty of life left: do not disturb the user')
+})
+
+test('the background login prompt is rate limited', async () => {
+  let now = Date.now()
+  const rt = stalledRuntime(Math.floor(now / 1000) + 1800, { now, clockNow: () => now })
+  await rt.core.init()
+  const first = await rt.core.autoTick()
+  assert.equal(first.loginRequired, true, 'the first prompt goes out')
+  now += 10 * 60e3 // past the tick throttle, still inside the prompt throttle
+  const second = await rt.core.autoTick()
+  assert.notEqual(second.loginRequired, true, 'a second prompt inside the window is suppressed')
 })
