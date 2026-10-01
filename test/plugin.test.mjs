@@ -5,7 +5,7 @@ import path from 'node:path'
 import vm from 'node:vm'
 import { EventEmitter } from 'node:events'
 import { test, before } from 'node:test'
-import { createCore, extractModelList, toProviderModels, buildCookieHeader, AUTO_REFRESH_MS, AUTO_RETRY_MS, CRED_REF } from '../lib/core.js'
+import { createCore, extractModelList, toProviderModels, buildCookieHeader, jwtExpiry, AUTO_REFRESH_MS, AUTO_RETRY_MS, CRED_REF } from '../lib/core.js'
 
 const tk = () => 't' + Math.random().toString(36).slice(2) + 'k'
 
@@ -99,14 +99,14 @@ const FALLBACK_MODELS = [
   {
     id: 'DeepSeek-V4.1-Flash',
     name: 'DeepSeek-V4.1-Flash (THU)',
-    contextWindow: 150000,
+    contextWindow: 1000000,
     input: ['text', 'image'],
     reasoningEfforts: { low: 'low', high: 'high', max: 'max' },
   },
   {
     id: 'qwen3.8-27b',
     name: 'qwen3.8-27b (THU)',
-    contextWindow: 150000,
+    contextWindow: 1000000,
     input: ['text', 'image'],
     reasoningEfforts: { low: 'low', medium: 'medium', xhigh: 'xhigh' },
   },
@@ -284,6 +284,7 @@ test('capture fallback writes a minted token to credentials and provider setting
       if (url.endsWith('/model-api/auth-login/check')) {
         return mintAllowed ? checkOk(token) : { status: 401, ok: false, location: '', text: '' }
       }
+      if (url.endsWith('/model-api/auth-login')) return authOk()
       return { status: 401, ok: false, location: '', text: '' }
     },
     cdp: async (arg) => {
@@ -796,4 +797,58 @@ test('the login window opens the Tsinghua SSO form with a debug port', async () 
   )
   assert.ok(argv.some((a) => a.startsWith('--remote-debugging-port=')), 'the debug port is what makes the capture possible')
   assert.ok(argv.some((a) => a.startsWith('--user-data-dir=')), 'the dedicated profile keeps the session between attempts')
+})
+
+// --- panel honesty: the token's own expiry, and the server's verdict ---------
+
+const jwtWith = (expSeconds, extra) => {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url')
+  const payload = Buffer.from(JSON.stringify({ iat: expSeconds - 21600, exp: expSeconds, ...(extra || {}) })).toString('base64url')
+  return header + '.' + payload + '.signature'
+}
+
+test('jwtExpiry reads the token itself instead of estimating', () => {
+  const exp = Math.floor(Date.now() / 1000) + 3600
+  assert.equal(jwtExpiry(jwtWith(exp)), exp * 1000)
+  assert.equal(jwtExpiry('not-a-jwt'), 0)
+  assert.equal(jwtExpiry(''), 0)
+  assert.equal(jwtExpiry('a.%%%.c'), 0)
+  assert.equal(jwtExpiry(null), 0)
+})
+
+test('the panel uses the token expiry, not the last fetch time', async () => {
+  const exp = Math.floor(Date.now() / 1000) + 600
+  const token = jwtWith(exp)
+  const rt = createRuntime({
+    credential: token,
+    // fetched a moment ago, so the old "lastGetAt + 6h" estimate would say 6 hours
+    stateData: { lastGetAt: Date.now(), auto: false, cookies: '', ssoCookies: '' },
+  })
+  const snap = await rt.core.init()
+  assert.equal(snap.expiresAt, exp * 1000, 'expiry comes from the token, not from when it was fetched')
+  assert.equal(snap.status, 'ok')
+
+  const gone = createRuntime({
+    credential: jwtWith(Math.floor(Date.now() / 1000) - 3600),
+    stateData: { lastGetAt: Date.now(), auto: false, cookies: '', ssoCookies: '' },
+  })
+  assert.equal((await gone.core.init()).status, 'expired', 'a token past its own exp is not "ok", whatever lastGetAt says')
+})
+
+test('a token the server refuses is reported instead of looking healthy', async () => {
+  const token = tk()
+  const rt = createRuntime({
+    http({ url }) {
+      if (url.endsWith('/model-api/auth-login/check')) return checkOk(token)
+      if (url.endsWith('/model-api/auth-login')) {
+        return { status: 200, ok: true, location: '', text: JSON.stringify({ success: false, status: 10003, message: 'nope' }) }
+      }
+      return { status: 500, ok: false, location: '', text: '' }
+    },
+  })
+  await rt.core.init()
+  const res = await rt.core.getTok()
+  assert.equal(res.serverValid, false, 'the server verdict must be recorded')
+  assert.equal(res.status, 'error')
+  assert.match(String(res.err), /服务端不接受/, 'and must be visible, not swallowed')
 })
