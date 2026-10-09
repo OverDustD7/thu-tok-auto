@@ -3,5 +3,20 @@ coverage/
 *.tgz
 *.log
 
+# Local browser profiles and generated diagnostic artifacts must never be published.
+/.probe-*/
+/test/preview/*.json
+/test/preview/*.jsonl
+/test/preview/shot-*.png
+
+# Local audit notebooks contain machine-specific paths and historical runtime readings.
+/docs/HANDOFF.md
+/docs/PLAN_2026-10-04.md
+/docs/REVIEW_2026-10-04.md
+/docs/MODIFICATION_REPORT_2026-10-03.md
+/docs/MODIFICATION_REPORT_2026-10-04.md
+/docs/KNOWN_ISSUES.md
+/docs/EVOLUTION.md
+
 # Review report stays local-only
 DSH插件检查与修改报告.md
