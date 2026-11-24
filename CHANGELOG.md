@@ -1,5 +1,13 @@
 # 版本记录
 
+## 0.3.25 — 2026-11-24
+
+- Provide an English main README and preserve the detailed Chinese guide in the npm package.
+- Document status signals, local session data, browser permissions, upgrade and removal behavior.
+- Check the 20-minute Auto interval in both language guides.
+- Observe the widget's own width and avoid rewriting unchanged UI text and classes.
+- Verify the actual release archive with the existing isolated fixture suite. Live THU login and natural Auto renewal remain subject to the known limitations.
+
 ## 0.3.24 — 2026-10-09
 
 本次汇总发布 0.3.6 之后的本地迭代；未合并 GitHub PR #1、#2、#3。

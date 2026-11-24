@@ -278,8 +278,13 @@ if (!ui.includes('var everyLabel = function (ms)')) throw new Error('ui.js must 
 if (!ui.includes('everyLabel(s.autoEveryMs)')) throw new Error('ui.js must read the Auto interval from the snapshot')
 if (ui.includes('计时超过 01:00')) throw new Error('ui.js must not hardcode the Auto interval in its hover text')
 const readme = fs.readFileSync('README.md', 'utf8')
-if (!readme.includes('20 分钟')) throw new Error('README must state the Auto interval the code actually uses')
-if (readme.includes('每满 **1 小时**')) throw new Error('README still promises the old hourly Auto interval')
+const readmeZh = fs.readFileSync('README.zh-CN.md', 'utf8')
+if (!readme.includes('every 20 minutes') || !readmeZh.includes('20 分钟')) {
+  throw new Error('Both READMEs must state the Auto interval the code actually uses')
+}
+if (/every (?:hour|1 hour|60 minutes)/i.test(readme) || readmeZh.includes('每满 **1 小时**')) {
+  throw new Error('A README still promises the old hourly Auto interval')
+}
 
 // The two carrier implementations a real machine can be driven through must be reachable from
 // outside the module (2026-10-04 round 10). They used to be anonymous arrows inside the deps

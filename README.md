@@ -1,260 +1,120 @@
-# thu-tok-auto（THU Tok Auto）
+# thu-tok-auto
 
-DSH / DeepSeek Harness 的 Cordis 插件：一键获取清华大学 MadModel 平台
-（`madmodel.cs.tsinghua.edu.cn`）的最新 API token，自动写入 DSH 模型配置，
-并支持到时自动续期。当前版本 **0.3.24**；更新内容见 [CHANGELOG](./CHANGELOG.md)，
-使用边界见 [已知限制](./docs/KNOWN_LIMITATIONS.md)。
+English | [简体中文](README.zh-CN.md)
 
-- **Get**：立即续期。依次尝试「用现有凭据签发新令牌 → SSO 重放 → 复用现有令牌」，
-  成功后写入 DSH 凭据 `MADMODEL_API_KEY` 并自动创建/复用模型 Provider
-  `llm-pi-ai.providers.madmodel`。**手动点 Get 不会被"现有令牌还有效"短路**：
-  自动路径都刷不出新令牌时它会直接打开登录窗口，**并且这一次点击就够了** ——
-  登录完成后插件自己捕获、校验、写凭据、同步 Provider，无需再点第二次；
-  等待期间控件会写着「等待登录」。
-- **Auto**：开关自动续期。开启后每满 **20 分钟**自动触发一次，任务运行在 Host 侧，
-  与页面是否打开无关，**也不依赖任何浏览器一直开着**。后台**永远不弹登录窗口**——
-  无人看管的机器上不该自己长出窗口；刷新不了就如实显示「需要登录」，等你点 Get。
-  这个间隔是量出来的、不是猜的：2026-10-04 在本机测到，重放所需的 IDP 会话在真实登录后
-  ~45 分钟仍被认得、70 分钟已经失效，而令牌本身有 6 小时——按小时排计划，多数尝试会落在
-  已经死掉的会话上。这是单机观察，不能保证所有账号的会话都能持续这么久。
-  失败重试有退避（5 分钟起翻倍，上限 30 分钟），但**令牌剩余不足 1 小时时退避降回 5 分钟**，
-  免得一记退避把下一次尝试拖过了期。
-- **计时器**：显示「距最近一次 Get 的本地经过时间」`hh:mm`（超过 99 小时停在 `99:xx`）。
-- **状态不只在悬停里**：健康时控件保持安静；一旦需要你动手（需要登录 / 令牌过期 /
-  续期未生效）或只完成了一半（令牌已更新但模型配置没写进去），控件会在下一行用**文字**
-  说明，同时改圆点颜色——不靠颜色单独表意，也不用悬停才看得见。
-  悬停另有完整信息：状态、上次获取时间、Token 剩余有效期与 Auto 说明，
-   以及**上一次点击**与**上一次自动运行**各自的判据（哪一级阶梯给的令牌、服务端是否确认、
-   用时、有没有开登录窗口）——两者分开记，因为整点自动运行会把「上一次运行」覆盖掉，
-   而被吞掉的那次点击恰恰是最需要留下证据的。
+[![npm version](https://img.shields.io/npm/v/thu-tok-auto?style=flat)](https://www.npmjs.com/package/thu-tok-auto) [![Node.js >=22](https://img.shields.io/badge/Node.js-%3E%3D22-339933?style=flat)](#requirements) [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat)](LICENSE)
 
-### 续期通道（2026-09-29 实测变更）
+A Cordis profile bundle for DSH / DeepSeek Harness that obtains THU MadModel API tokens, writes them to DSH credentials and synchronizes the matching model provider.
 
-站点的免登录签发端点 `/model-api/auth-login/check` **已不再允许无凭证签发**
-（返回 `10001 ticket已过期或无效，请重新登录`）；保存的 SSO 会话过期后，
-`/model-api/auth-login` 会返回 `10003 抱歉哦，您无此权限`。插件因此按下面的顺序续期：
+[Changelog](CHANGELOG.md) · [Known limitations (中文)](docs/KNOWN_LIMITATIONS.md) · [npm](https://www.npmjs.com/package/thu-tok-auto)
 
-1. **用现有凭据签发** —— 站点已关闭免登录签发，通常直接失败（返回 `10001`）；
-2. **SSO 重放** —— 用保存的 cookie 走一遍统一认证链取一次性 ticket，再换令牌。
-   **这条也是登录窗口捕获失败时的兜底**：登录成功后页面即使还没把令牌写进
-   `localStorage`，新拿到的 SSO cookie 也能直接换成令牌；
-   这条链需要浏览器算设备指纹时，插件用**自己启动的那台无窗口浏览器**补最后一步：
-   先把保存的会话按域/路径写进它，**再**让它访问登录入口 —— 会话不先交进去，那台浏览器
-   读到的永远只是登录页（这条以前是缺的，无窗口续期因此一直走不通）；
-3. **复用现有令牌** —— 仍然有效就直接用：控件保持绿灯，**不报警**；
-4. **打开登录窗口** —— 只在你**手动点 Get** 时（哪怕手上那枚旧令牌仍可用，因为你点它就是要
-   刷新，而登录是唯一还能刷新的门）。打开后**这一次点击就够了**：插件每 2.5 秒看一次那个
-   窗口，登录完成即自动捕获→校验→写凭据→同步 Provider，然后**把它自己开的窗口关掉**。
-   后台 Auto 永不弹窗。
-5. **判据：拿到令牌先比 `exp`** —— 同一张令牌回来时（会话没变，站点就返回原来那串）
-   **不算刷新成功**：状态显示「刷新未生效：到期时间未前进」，圆点转橙，而不是继续显示 ok。
+## Status and support
 
-**登录状态是怎么留住的**：插件在登录窗口还开着时读取 cookie 与页面令牌，
-将会话材料保存到本地，令牌写入 DSH 凭据服务。会话 cookie 通常不会由浏览器常规持久化；
-插件恢复保存的 cookie 后能否继续使用，仍由服务端的过期、撤销与设备校验决定。
-Cookie 按**全量**保存，请求时按目标 URL 逐跳筛选（域 + 路径 + secure + 未过期），
-跨 `id.` / `oauth.` / `auth*.tsinghua.edu.cn` 与 madmodel 都会带上对应的一份。
-由此：**登录窗口用完就会自动关闭**（成功捕获之后，或超时/你手动关掉/插件卸载时），
-不需要你留着它 —— 但这也意味着**续期靠的是那份保存下来的会话材料**：
-它过期之后，下一次就得再登录一次（点一次 Get 即可）。
+Maintenance scope: fixes and compatibility maintenance. Published versions are listed on [npm](https://www.npmjs.com/package/thu-tok-auto); changes are recorded in the [changelog](CHANGELOG.md).
 
-- 令牌有效期间控件保持绿色且**不写多余文字**；「续期通道不可用」只在悬停说明里，
-  以及**需要登录**这类要你动手的状态下出现在第二行，不常驻警告；
-- **网络不可达 ≠ 令牌坏了**：一个请求都没连上站点时，控件写的是
-  「网络不可达：连不上 madmodel 站点，Token 仍可用，稍后自动重试」（圆点转琥珀＝未能校验），
-  不会把你引去重新登录；下一次成功运行会立刻清掉这句话；
-- **只完成一半也会说出来**：令牌写进去了但模型配置没写成功时，状态是 `partial`
-  （「Token 已更新，但模型配置未同步：…」），而不是假装整体成功；
-- 登录窗口**直接落在清华统一认证登录页**
-  （`id.tsinghua.edu.cn`，带 `?/authLogin` 回调，登录成功会跳回 madmodel）。
+The host contracts were historically checked against DSH `0.2.0-rc.2`. Browser discovery and process cleanup primarily target Windows with Edge or Chrome; other platforms have not completed real-device acceptance. **Automatic renewal against the live THU service remains unverified**: mocked regressions do not establish that the server will accept a restored session or a hidden browser's fingerprint. This documentation update does not certify a new live test.
 
-默认挂在左侧边栏底部：**「设置」按钮上方**；若设置上方已有其他插件的按钮
-（如 Remote），则置于**最顶部按钮的上方**。Get/Auto 在左、计时器在右，
-与 DSH 主题一致。连「设置」按钮都找不到时暂不显示，并持续重试。
+## Requirements
 
-## 安装
+- Node.js **22 or later**; the plugin uses built-in `fetch` and `WebSocket`.
+- A DSH profile with the settings, credentials, timer, web server, connection and `llm-pi-ai` services.
+- Edge or Chrome on the host for interactive login and browser-assisted renewal.
+- An authorized MadModel account and network access to MadModel and THU identity services. Off-campus WebVPN is not supported by this version.
 
-作为 **DSH profile bundle**（正式 npm 插件）安装，随 profile 声明同步：
+## Installation
 
-```sh
+Install the published profile bundle:
+
+```bash
 dsh plugin --profile web add thu-tok-auto
 ```
 
-然后**重启 DSH Web**（或对应 profile）使插件加载。也可手动在
-`~/.dsh/profiles/web/package.json` 的 `dependencies` 与 `dsh.profile.bundles`
-中加入 `thu-tok-auto` 后重新安装。
+Restart the corresponding DSH host/profile. A page refresh alone does not reload host code. The installation signal is the **Get / Auto / elapsed-time** row above Settings in the sidebar (above other buttons in that group, when present). Its appearance confirms UI loading, not successful authentication.
 
-更新：
+The command is the existing documented DSH installation interface; this documentation-only update did not run it against a shared profile. Substitute your intended profile for `web` when appropriate.
 
-```sh
+## Quick start
+
+1. Click **Get**. The plugin tries existing-credential issuance, saved SSO replay and reuse of an existing token. If a manual request cannot obtain a fresh token, it opens its own login window. Complete THU login there; the same request should capture, validate, store and synchronize the token without a second click, then close that window.
+2. Inspect the status text and hover details. A healthy result requires server validation, a usable stored credential and successful provider synchronization. `partial` means one of these steps did not complete. Receiving the same expiry is reported as renewal not taking effect, not as a fresh token.
+3. Enable **Auto** for host-side renewal attempts every 20 minutes. It does not require the DSH page or login window to remain open. **The DSH host must remain running.** Auto never opens an interactive login window; when saved sessions stop working, click Get and log in again.
+
+The timer measures local time since the last recorded Get, **not time until token expiry**. It displays `--:--` without a baseline and caps the hour field at 99. Hover details separate the last manual request from the last automatic run.
+
+To assess live Auto behavior, expiry must advance on a natural automatic run after login. No account login or live renewal was performed for this documentation candidate; do not infer that acceptance from the UI or unit tests.
+
+## Configuration, data and permissions
+
+No token needs to be pasted into public configuration. The plugin stores the token through DSH's credential service as `MADMODEL_API_KEY`, and uses `settings.describe()` / `settings.update()` to merge the matching provider's `apiKeyEnv` and `models`.
+
+It identifies a provider by the credential reference or MadModel base URL, including the supported local-forwarding case. Otherwise it creates `llm-pi-ai.providers.madmodel` with `api: openai-completions`. A conflicting unrelated `madmodel` key is reported rather than overwritten. Other providers are preserved; **manual model entries inside the selected provider can be replaced by the next synchronization**. This plugin's current model synchronization targets THU MadModel; it does not manage Paratera providers.
+
+| Data or permission | Purpose and retention |
+| --- | --- |
+| DSH credential `MADMODEL_API_KEY` | Stores the API token. Storage protection is provided by DSH; this plugin does not claim a separate encrypted vault. |
+| `%USERPROFILE%\.dsh\madmodel\state.json` | Stores cookies/SSO session material, Auto preference, timestamps and diagnostics. New state omits the token; legacy tokens are migrated to DSH credentials. Treat the entire file as a credential. |
+| `%USERPROFILE%\.dsh\madmodel\profile\` and temporary carrier profiles | Browser login/session data. Owned temporary carrier profiles may be cleaned up; persistent state and the shared login profile are not a logout mechanism. |
+| Browser launch, loopback DevTools ports 9333–9343 and process inspection | Capture login and restore saved sessions only after checking browser ownership. Windows fallback termination requires matching recorded process identity; it does not kill browsers by name. |
+| DSH settings and credential writes | Configure the selected provider and replace its token after validation. Removing the plugin does not automatically undo these writes. |
+
+The state writer requests file mode `0600` on a best-effort basis; that is **not a guarantee of Windows ACL isolation or encryption**. Protect the host user account, backups and directory access. Never attach the state file, browser profile, credential store, authentication URLs or raw diagnostics to a public issue.
+
+The plugin makes authentication/model-list requests to MadModel and THU identity services and uses local DevTools connections. Cookies are selected by destination domain, path, secure flag and expiry; restored browser cookies are subject to ownership and host checks. There is no telemetry submission in the plugin's current implementation. This statement does not cover the host, browser or remote service's own data handling.
+
+### Renewal and model-list behavior
+
+The saved SSO session, rather than an indefinitely open browser, enables later attempts. Server expiry, revocation, device checks and network access can prevent renewal. Historical observations found anonymous issuance rejected on 2026-09-29 and replay sessions shorter-lived than the token; these are dated observations, not a service contract.
+
+Auto retries use 5/10/20/30-minute backoff. With less than one hour of token lifetime remaining, retry delay returns to five minutes; this cannot guarantee renewal before expiry. A reused token is not a fresh issuance. A network failure leaves validation unknown rather than proving the token invalid; a rejected or unvalidated candidate must not replace a credential still known to work.
+
+The model list is read from the site's frontend bundle, cached for six hours, and falls back to a built-in list if parsing fails. `DeepSeek-V4-Flash-Vision-Exp` and `DeepSeek-R1-W8A8` are excluded. The configured context window is 1,000,000 tokens, based on historical measurements, not a newly verified capacity promise. See the [Chinese technical detail](README.zh-CN.md#模型列表跟着站点走) for the original measurements and exclusions.
+
+## Upgrade and uninstall
+
+```bash
 dsh plugin --profile web up thu-tok-auto
 ```
 
-## 使用
+Restart the host/profile after upgrading. Version 0.2.1 and later use a profile bundle; older dynamic-plugin installations require checking the host's installation state. Existing local state is reused, and legacy token migration does not revoke a server-side token.
 
-1. 安装并重启后，侧边栏底部「设置」上方出现 **[●] [Get] [Auto ✓]　hh:mm** 控件
-   （若 Remote 等插件已在设置上方，则排在其最上方；Auto 关闭时按钮显示为 Auto）；
-2. 点 **Get** —— 按下面的「获取阶梯」逐级续期：能自动续上就绿点亮起、token 已写入；
-   自动路径都刷不出新令牌时会打开登录窗口，**登录完成后无需再点第二次**（控件会先写
-   「等待登录」、再写「正在处理」），插件自己完成捕获→校验→写凭据→同步 Provider，
-   然后关掉它自己开的那个窗口；
-3. 点 **Auto** 开启自动续期：按钮变绿、白字 **Auto ✓**（再次点击关闭恢复原样）。
+To uninstall, remove `thu-tok-auto` from the intended profile's bundle declaration (`dsh.profile.bundles`) and dependency declaration in its `package.json`, reconcile that profile's dependencies through its supported package-management workflow, then restart the host. No host-specific CLI removal command is claimed here because it has not been verified. Avoid editing a different active profile.
 
-免登录签发在 2026-09-29 被站点关掉了（无凭据调用返回 `10001`），所以现在**必须先登录过一次**：
-手上有仍可用的令牌就直接复用；自动路径都刷不出新令牌时，**手动点 Get 会打开清华统一认证登录页**，
-登录完成后自动捕获并继续。后台 Auto 永不弹窗：无人看管时它只会如实显示「需要登录」，
-不会在旁边自己弹出窗口。拿到同一张令牌时不会显示成功，而是如实标成「刷新未生效」。
+Unloading attempts to close only an identifiable plugin-owned browser. **It does not automatically delete persistent state/profile data, remove `MADMODEL_API_KEY`, remove the synchronized provider or revoke THU sessions/tokens.** For complete removal, after the relevant host/profile has stopped using them, separately remove the plugin's data directory and use DSH's supported credential/settings controls to remove entries no other component needs. Revoke sessions/tokens through the issuing service where required. No cleanup or revocation was executed for this candidate.
 
-## 工作原理
+## Limitations and troubleshooting
 
-### 获取阶梯（依次尝试）
+- **No control row:** confirm installation in the intended profile and restart the host. The row depends on DSH's sidebar DOM and may fail to mount after host changes; a frontend refresh cannot update host code.
+- **Needs login / expired:** saved server sessions may have expired. Click Get and complete login once; Auto will not display a login window on its own.
+- **Renewal did not take effect:** the returned expiry did not advance. A green Auto switch means scheduling is enabled, not that renewal succeeded.
+- **Network unreachable / validation unknown:** check connectivity first; these messages alone do not establish that the token was revoked.
+- **Token updated, provider not synchronized:** treat the operation as partial and inspect the configuration error without posting secrets.
+- **Browser ownership cannot be verified:** cleanup refuses uncertain ownership. Do not stop unrelated browsers. `node lib/stop-owned.js --dry-run` inspects the plugin's local ownership record; `node lib/stop-owned.js` attempts verified cleanup. These are operational commands, not privacy-safe report generators.
+- **Timer differs from service behavior:** the panel decodes JWT `exp` against the local clock; keep system time synchronized. Historical six-hour token life and approximately 45-minute reusable SSO sessions are observations, not guaranteed limits.
+- Do not manually join lines from DSH's YAML credential file: quoted YAML continuation escapes are not part of the token. Use DSH's credential service or a YAML parser when appropriate.
 
-| 层级 | 方式 | 说明 |
-| --- | --- | --- |
-| 1 | `GET /model-api/auth-login/check`（用现有凭据） | 用已在凭据里的令牌直接换一枚新令牌 |
-| 2 | SSO 重放 | 用保存的 cookie jar 走一遍统一认证链取 ticket；**登录窗口捕获时也用它兜底**（页面还没写 `localStorage`，cookie 已经能用了） |
-| 3 | 复用已保存 token | 仅当旧 token 仍被 `/model-api/auth-login` 校验通过 |
-| 4 | 打开登录窗口 | **只在你手动点 Get 时**；一次点击即完成全部后续（捕获→校验→写→同步→关窗）。后台 Auto 永不弹窗 |
-| 5 | 比 `exp` 判成败 | 拿回同一张令牌（会话未变）不算刷新成功，状态标成「刷新未生效」而**不是** ok |
+See [known limitations](docs/KNOWN_LIMITATIONS.md) for unverified live renewal, Windows-centric browser support, WebVPN and cleanup limits. The original Chinese README preserves additional technical history.
 
-成功签发的 token 会同时写入：
+## Development
 
-- DSH 凭据：`credentials.set('MADMODEL_API_KEY', token)`
-- DSH 模型配置：按 `apiKeyEnv: MADMODEL_API_KEY`，或 baseURL 指向 madmodel
-  （含本地转发 `http://127.0.0.1:…/v1` 的情形）找到目标 Provider；找不到则自动创建
-  `llm-pi-ai.providers.madmodel`（`api: openai-completions`）。写入走 DSH 的
-  `settings.describe()` + `settings.update()`，**只合并目标的 `apiKeyEnv` 与 `models`**，
-  不会把其他 Provider 复制成用户层覆盖，也不会抹掉同命名空间下的其他 Provider；
-  `madmodel` 这个键已被别的配置占用时宁可不写并报错，也不覆盖它。
+From a source checkout:
 
-### 模型列表跟着站点走
+```bash
+npm run check
+npm test
+```
 
-站点的模型会改名、下架、换档位（2026-09 就把 `DeepSeek-V4-Flash-0731` 换成了
-`DeepSeek-V4.1-Flash`，旧名字现在请求直接返回"模型不存在"）。插件不写死这份名单：
+The package uses Node built-ins and host-provided services; `package.json` declares no runtime dependencies. `npm run check` checks syntax and host/bundle contracts. Tests use dependency-injected environments and fixtures. The 213 fixture regressions and bundle checks are used for release preparation. Live THU login and natural Auto renewal still require separate acceptance against the service. `prepack` normally runs both commands.
 
-- 每次 Get / Auto 签发后，从站点自己的前端包里读它正在用的模型列表
-  （站点没有模型列表接口，`/v1/models` 会落回 SPA），转成 provider 的 `models`
-  写进去；列表与现有配置一致时不写盘。结果缓存 6 小时，避免每次重复下载几 MB 的包。
-- 读不到时回退到代码内置的名单，功能不受影响。
-- 排除名单（`EXCLUDED_MODEL_IDS`）：`DeepSeek-V4-Flash-Vision-Exp`（V4.1-Flash
-  已覆盖图片输入）与 `DeepSeek-R1-W8A8`。
-- 注意：既然名单跟着站点走，**手动往 provider 里加的模型会在下一次签到时被同步覆盖**；
-  要长期保留请加进代码里的名单。
-- `contextWindow` 统一写 **1000000**，取两个实测上限中较小的那个（2026-10-01 复测）：
-  模型侧 1,048,576 prompt tokens 通过、再往上被拒（返回「服务器繁忙」）；网关侧
-  `client_max_body_size 8m`，8,388,608 字节通过、8,388,609 被 413（折合英文约 134 万
-  token）——所以现在**模型才是瓶颈**。留约 4.8 万 token 给系统提示与工具定义。
-  （旧的 150000 来自 2026-10 之前那个 1 MiB 网关上限，已被站点抬高。）
+`lib/core.js` contains lifecycle and synchronization logic; `lib/index.js` wires host services, routes and browser adapters; `lib/ui.js` renders the control. `test/preview/` is an isolated fake-state preview and is excluded from the npm package. Source-only reports and private migration/orchestration material must not be added to the package.
 
-### 时间语义（实测数据）
+- [Changelog](CHANGELOG.md)
+- [Known limitations (中文)](docs/KNOWN_LIMITATIONS.md)
+- [Original technical detail and historical measurements (中文)](README.zh-CN.md)
 
-- 令牌是 6 小时的 JWT（`exp − iat == 6h`，历史采样观察，并非站点保证）。
-  面板按本地时钟计算剩余寿命；若签发服务时钟比本地快约 9.6 分钟，显示值会
-  **高估**服务端的剩余寿命约 10 分钟。请保持系统时钟同步，并以服务端校验为准。
-- **面板的剩余时间直接取令牌自己的 `exp`**（本地解码，不发请求），不再用「最近一次获取
-  时间 + 6h」估算：后者在「读回浏览器里那枚旧令牌」时会多报寿命——2026-10-01 实测到
-  令牌 14:06 签发、16:30 读回，面板按 16:30 + 6h 报，多出约 2.4 小时。
-- **每次拿到令牌后都向服务端核对一次**（`/model-api/auth-login`），结果记进状态；服务端
-  明确拒绝（401/403，或 200 且 `success:false`）时面板按「已失效」显示，而不是继续显示 ok。
-  核对**问不出结果**时（连不上、答非所问）**不写判定**：状态是 `partial`
-  （「未能向服务端校验：判定未知」），而不是把网络问题写成"服务端不接受该令牌"。
-- 计时仍是本地量：`now − 最近一次获取时间`。
-- **Auto 间隔 20 分钟**：不按令牌寿命卡点，每满 20 分钟尝试续期一次（假定 6h 寿命只是 JWT
-  解码结果、不是站点的保证，固定间隔比精确卡点更稳）。这个数是实测窗口，不是对 SSO 寿命的
-  断言：能重放的 IDP 会话比令牌短得多（2026-10-04 本机：~45 分钟仍认得、70 分钟已失效），间隔
-  必须落在它还活着的区间里，否则"到期就续"只是名义上的自动。重试退避 5→10→20→30 分钟，
-  但**剩余寿命不足 1 小时时退避下限降回 5 分钟**。若你更在意签发次数，关掉 Auto 手动点 Get
-  即可——插件自己不会改这个开关，面板里的 `01:00`/`00:20` 也是宿主报上来的、不是界面猜的。
-- 计时从未获取过/无基准时显示 `--:--`；超过 99 小时停在 `99` 小时不再增长
-  （这个字段是固定宽度的时钟，三位数会把这一行撑出侧栏）。
+## Feedback and security
 
-## 平台限制（重要）
+Report reproducible, sanitized problems through [GitHub Issues](https://github.com/OverDustD7/thu-tok-auto/issues). Include host/plugin versions, the failing step and redacted status text. No private security-reporting channel is verified in this documentation; do not post credentials, cookies, authentication URLs or personal information publicly.
 
-### 不要手解析凭据文件
+## License and third-party notices
 
-`~/.dsh/.credentials.yaml` 里 `MADMODEL_API_KEY` 的值是 **YAML 双引号折行标量**：
-**行尾的 `\` 是续行转义符，不属于值本身**（真值 275 字符；按行拼起来会得到 278 字符并
-带上反斜杠，服务端一律回 `10003`）。插件走 DSH 的凭据服务（`credentials.resolve`），
-这一点是对的；任何脚本或文档示例要自己取这个值，请用 YAML 解析器，不要手动拼行或过滤字符。
-2026-10-01 有会话因为这一步出错，把"服务端拒绝令牌"写进了文档，
-事后更正。
-
-- 插件以 profile bundle 形式运行在 DSH 宿主进程，UI 通过 DSH 的结构化页面注入表
-  加载全局脚本：**页面刷新（F5）后按钮自动重新出现**（不再需要重新激活插件）。
-- UI 信息（状态、计时基准）通过 `/thu-tok-auto/api/*` 每 10 秒轮询更新，
-  计时器本身在页面本地每秒走字。
-- 本机浏览器登录捕获依赖 Edge/Chrome 的 DevTools 调试端口（本机 9333–9343）；
-  同时识别系统级和当前用户目录下的浏览器安装。
-- **只关自己开的那个窗口**：插件在启动浏览器后**有界探测一次它自己的调试端点**，
-  记下这个实例的 DevTools 身份（`…/devtools/browser/<uuid>`），用完（或超时、或你手动
-  关掉、或插件卸载）按这台实例的身份请求关闭，**关闭后还要复探确认**。
-  若 CDP 无法确认关闭，Windows 上可以用进程表核验启动记录：专属 profile、
-  可执行文件、记录的 pid 与启动时间，以及调试端口等证据必须匹配，才允许
-  `taskkill /PID … /T /F` 清理核验过的自有进程树；不会按 Chrome/Edge 进程名批量结束。
-  身份明确不匹配、证据不足或进程表不可读时拒绝回退，并如实报告未确认关闭。
-  可用 `node lib/stop-owned.js --dry-run` 先查看记录，再用
-  `node lib/stop-owned.js` 尝试清理自有残留。
-
-## 状态与文件
-
-- 状态文件：`%USERPROFILE%\.dsh\madmodel\state.json`
-  （cookies、ssoCookies、lastGetAt、auto；不再保存 token）。旧版状态中的 token
-  会迁移到 DSH 凭据存储，并从状态文件移除。
-- 登录浏览器配置目录：`%USERPROFILE%\.dsh\madmodel\profile\`；从本机 CDP 端口
-  9333–9343 中选择未占用端口，只连接 URL 主机名严格匹配清华域的页面。
-- token 只写入 DSH 凭据引用 `MADMODEL_API_KEY`，不会通过 HTTP 发给浏览器，
-  也不会出现在任何子进程命令行中。
-- 无任何遥测；网络访问仅限 MadModel 与清华统一身份认证域名，以及本机 CDP。
-
-## 兼容性与验证
-
-- Node.js >= 22（登录捕获使用 Node 内置 WebSocket 与 fetch）；已在 DSH
-  `0.2.0-rc.2` 上逐项核对 profile bundle（`dsh.bundle.patch`）、settings
-  （`describe()` / `update()`；**本插件不使用也不存在 `settings.get()`**）、
-  credentials（`resolve` / `set`）、timer、webServer（`webserver/index-inject`
-  注入表）、connection（`requestRejection` 判拒）与 `llm-pi-ai`
-  （`providers` 是 volatile 字段，写入即时热更新、无需重启）。
-- `npm run check`：检查 Host/核心/UI 语法与补丁声明，并断言若干 DSH 契约
-  （例如任何文件都不得出现 `settings.get(`、站点包请求必须放大响应上限）。
-- `npm test`：213 项行为回归（token 生命周期、Provider 写入与不覆盖、
-  Auto 退避与"后台永不弹窗"边界、登录捕获与一次点击全链、
-  一次点击后 Auto 只用存下来的会话换新 token 且 `exp` 必须前进、
-  **登录成功那一次捕获必须自己留下运行记录**（捕获臂在 `runGetTok` 返回后才结束，
-  它得在每种出口都记账；窗口已经交出令牌的那一次不再额外花掉会话去问将来——
-  没有谁能担保那次兑换的副作用）、
-  只关自己那个窗口（实例身份 + 关闭后复探确认）、
-  三态校验（连不上≠被拒绝）、断网≠令牌失效、同一张令牌不算续期、
-  未被校验或被拒的候选不覆盖还能用的凭据、
-  UI 文本层与注入清理、Host 请求校验边界、
-  **版式按容器宽度分层**（容器 34px ⇒ 收起态；容器 240px 而浏览器窗口只有 54px
-  仍保持整行——判据是父容器，不是 viewport）。
-  其中**线路回归**走的是生产路由：用面板真正发出的请求形状
-  （`POST` + `application/json` + `{}`）打进 Host 注册的那条 `get-tok`，
-  断言这次运行**以无参数**启动（请求体不能把点击变成后台运行）、
-  并在续期通道下线时确实开出登录窗口；另有一条断言「上一次点击」的记录
-  不会被随后的 Auto tick 覆盖。发布前 prepack 自动执行。
-- `test/preview/`：**隔离预览工装**（假状态、无真实凭据、不出网）。可离线渲染
-  九种状态的浅色/深色 × 宽（280/260/200）/收起（54）版式并量测几何、导出截图，
-  用于评审界面改动；仅开发使用，不随 npm 包发布。
-
-## 开发与源码
-
-- GitHub：<https://github.com/OverDustD7/thu-tok-auto>
-- npm：<https://www.npmjs.com/package/thu-tok-auto>
-- 源码结构：
-  - `lib/core.js` —— 核心逻辑（依赖注入，可独立单测）：获取阶梯、凭据/配置写入、
-    状态迁移、Auto 判据、登录捕获编排；
-  - `lib/index.js` —— Cordis 插件入口：装配真实环境（Node fetch/WebSocket/fs、
-    DSH settings/credentials/timer/webServer/connection），提供
-    `/thu-tok-auto/api/*` 与 UI 注入；
-  - `lib/ui.js` —— 浏览器端全局脚本 UI。
-- 文档：[版本记录](./CHANGELOG.md)、[已知限制](./docs/KNOWN_LIMITATIONS.md)、
-  [0.3.24 发布整理报告](https://github.com/OverDustD7/thu-tok-auto/blob/master/docs/RELEASE_REPORT_2026-10-09.md)。
-
-`0.2.0` 及更早版本为「DSH 会话内动态 Cordis 插件」形态（`lib/host.js` /
-`lib/client.js`）；`0.2.1` 起改为可直接安装的 profile bundle。行为与状态文件
-路径保持一致，切换无需迁移。
-
-## License
-
-MIT
+[MIT](LICENSE); the existing copyright notice is preserved. DSH, Node.js, Edge/Chrome and THU services are separate third-party products/services governed by their own terms and licenses. They are not redistributed by this package; this plugin does not grant access to THU services or imply their endorsement.
