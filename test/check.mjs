@@ -139,7 +139,11 @@ if (!core.includes('HEADLESS_TIMEOUT_MS') || !core.includes('HEADLESS_RETRY_MS')
 if (/function startHeadlessRenewal[\s\S]{0,900}RENEWAL_MARGIN_MS/.test(core)) {
   throw new Error('the headless arm must not gate on the token clock: a due run is the caller\'s call')
 }
-if (!/function startHeadlessRenewal[\s\S]{0,1600}state\.browserOpen \|\| state\.loginWait/.test(core)) {
+// The window grew in 0.3.26: the login-form branch now asks the optional account store before
+// it gives up, so the busy check sits further down the same function. The invariant is
+// unchanged — an unattended run still may not take over an open window (openLogin checks it
+// again on its own head, which is why both readings are allowed to satisfy this).
+if (!/function startHeadlessRenewal[\s\S]{0,3000}state\.browserOpen \|\| state\.loginWait/.test(core)) {
   throw new Error('an unattended run must never take over a window that is already open')
 }
 if (!core.includes('HEADLESS_STALLED') || !core.includes('MANUAL_LOGIN_HINT')) {
@@ -291,8 +295,13 @@ if (/every (?:hour|1 hour|60 minutes)/i.test(readme) || readmeZh.includes('每�
 // literal, so the only way to "verify" them on a real Edge was to copy them into a probe —and a
 // copy proves nothing about what ships. The seam is assigned, never read, by the plugin itself:
 // a host that injects its own http/cdp still gets its own function (pickFn decides first).
-if (!entry.includes('const carrierDefaults = { hiddenTarget: null, cdp: null, sessionRestore: null, listBrowserProfiles: null }')) {
+if (!entry.includes('const carrierDefaults = { hiddenTarget: null, cdp: null, sessionRestore: null, listBrowserProfiles: null, loginDriver: null }')) {
   throw new Error('index.js must keep every shipped carrier implementation reachable as a test seam')
+}
+// The account-login driver is the fifth seam (2026-11-28): the thing that types into the real
+// unified-auth form has to be the shipped function, not a copy in a probe.
+if (!entry.includes('carrierDefaults.loginDriver = createLoginDriver({})')) {
+  throw new Error('the shipped account-login driver must be reachable from outside apply()')
 }
 if (!entry.includes('carrierDefaults.hiddenTarget = async')) {
   throw new Error('the shipped hidden-page carrier must be reachable from outside apply()')
@@ -579,6 +588,114 @@ for (const name of fs.readdirSync('test')) {
       throw new Error(`test/${name}:${i + 1} hands the fake host timer a sleep() the real host does not have`)
     }
   }
+}
+
+// ---- the optional account arm (2026-11-28) ------------------------------------------
+// The shapes that make the feature safe are structural, so they are pinned here: a password
+// is encrypted before it is written, it is typed into exactly one page, and the store is
+// consulted only from the step that needs it.
+const loginLib = fs.readFileSync('lib/auto-login.js', 'utf8')
+const storeLib = fs.readFileSync('lib/secret-store.js', 'utf8')
+if (!storeLib.includes("createDpapiAdapter") || !storeLib.includes("'dpapi-currentuser'")) {
+  throw new Error('the account must be sealed with DPAPI; there is no other cipher in this bundle')
+}
+if (!storeLib.includes("return { ok: false, reason: 'unsupported' }")) {
+  throw new Error('a machine without DPAPI must refuse the account, not fall back to plain text')
+}
+if (!storeLib.includes('if (!tmpAcl || tmpAcl.ok !== true)')) {
+  throw new Error('a record that cannot be restricted to this account must be deleted, not kept')
+}
+if (!storeLib.includes("reduce") && !storeLib.includes('revision')) {
+  throw new Error('a stored account needs a revision so a refusal can be bound to it')
+}
+if (/writeFile(Sync)?\([^)]*password/i.test(storeLib)) {
+  throw new Error('the store must never write a password in the clear')
+}
+if (!loginLib.includes("export const SSO_ORIGIN = 'https://id.tsinghua.edu.cn'")) {
+  throw new Error('the login arm acts on one origin, spelled once')
+}
+if (!loginLib.includes('export function classifyPage')) {
+  throw new Error('the page decision must stay a pure function a fixture can drive')
+}
+if (!loginLib.includes('src: ') && !loginLib.includes("'captcha-required'")) {
+  throw new Error('the arm must be able to say a CAPTCHA or an MFA stood in the way')
+}
+if (!entry.includes('export function createLoginDriver')) {
+  throw new Error('the page driver must be exported so a probe drives the shipped function')
+}
+// Second pass (2026-11-28): the values may only leave as arguments of one context-bound call.
+// The old shape — focus, Input.insertText, focus, Input.insertText, click — had awaits between
+// the checks and the last keystroke, so a navigation could put a password into a page nobody
+// approved. Neither the keystroke path nor a secret in an expression string may come back.
+if (entry.includes("send('Input.insertText'")) {
+  throw new Error('the values must not be typed through separate input calls: they leave in one bound call')
+}
+if (!entry.includes("send('Runtime.callFunctionOn'")) {
+  throw new Error('the fill must be one Runtime.callFunctionOn bound to a verified execution context')
+}
+if (!entry.includes('uniqueContextId: uniqueContextId')) {
+  throw new Error('the fill must be pinned to the execution context the preflight read')
+}
+if (!entry.includes('arguments: [{ value: username }, { value: password }]')) {
+  throw new Error('the values must travel as CDP arguments, never inside an expression string')
+}
+if (/expression:[^,\n]*password/.test(entry) || /functionDeclaration:\s*[^,\n]*password/.test(entry)) {
+  throw new Error('no expression or function source may interpolate a value')
+}
+if (!loginLib.includes('export function buildFillScript')) {
+  throw new Error('the fill function must be built where the page rules live, from the same sources')
+}
+if (!loginLib.includes('reason: "wrong-method"')) {
+  throw new Error('a form that would submit with GET must be refused before anything is written')
+}
+if (!loginLib.includes('submitter.getAttribute("formaction")')) {
+  throw new Error('the submitter override has to be resolved, not just the form action attribute')
+}
+// The gate order inside the driver: the identity is verified, then the page origin is decided,
+// and only then is anything written. Anchors are measured inside the driver, because /json/list
+// and readInstance also appear in the reader above it.
+const driverStart = entry.indexOf('export function createLoginDriver')
+const driverCite = entry.indexOf("reason: 'not-ours' }", driverStart)
+const driverWrite = entry.indexOf("send('Runtime.callFunctionOn'", driverStart)
+if (driverStart < 0 || driverCite < 0 || driverWrite < 0 || !(driverCite < driverWrite)) {
+  throw new Error('the driver must prove the instance before it writes anything into a page')
+}
+// Cancellation is read with no await between the question and the send: a clear that lands
+// during the handshake or the navigation must stop the values, not just void the verdict.
+const cancelAt = entry.indexOf('if (cancelled()) return { ok: false, reason: \'cancelled\', facts: scrubFacts(preflight) }', driverStart)
+if (cancelAt < 0 || !(cancelAt < driverWrite)) {
+  throw new Error('the cancellation check must sit immediately before the secret-bearing call')
+}
+// Nothing may sit between the question and the send except the statement that performs it:
+// no read, no wait, no second opinion that could let a cleared account still be typed.
+const sendAt = entry.indexOf('filled = await', cancelAt)
+const between = sendAt < 0 ? 'await ' : entry.slice(cancelAt, sendAt)
+if (sendAt < 0 || sendAt > driverWrite || /\bawait\b/.test(between)) {
+  throw new Error('nothing may await between the cancellation check and the secret-bearing call')
+}
+if (!core.includes('cancelled: function () { return autoLoginGeneration !== generation; }')) {
+  throw new Error('core must hand the driver the generation it is allowed to act under')
+}
+if (!core.includes('async function credentialLoginReady()') || !core.includes('async function attemptCredentialLogin(port)')) {
+  throw new Error('the account arm must be reached through its own readiness and attempt steps')
+}
+if (!core.includes("loginFill: true")) {
+  throw new Error('the login-form step must ask for the carrier that fills the form')
+}
+if (!core.includes("if (carrier === 'headless' && deps.sessionRestore && !loginFill)")) {
+  throw new Error('the login-fill carrier must skip a session handover it has no session for')
+}
+if (core.includes('store.load(') || core.includes('secretStore.load(')) {
+  throw new Error('core must never decrypt the account itself: the attempt seam owns that')
+}
+if (!core.includes('credentialsChanged: credentialsChanged')) {
+  throw new Error('saving or clearing the account must supersede an attempt already in flight')
+}
+if (!ui.includes("pInput.type = 'password'") || !ui.includes('mmtok-password')) {
+  throw new Error('the account dialog must take the password in a write-only password field')
+}
+if (!/pInput\.value = ''/.test(ui)) {
+  throw new Error('the password field must be emptied on every exit path')
 }
 
 console.log('Bundle form checks: OK')

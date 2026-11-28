@@ -12,7 +12,7 @@ A Cordis profile bundle for DSH / DeepSeek Harness that obtains THU MadModel API
 
 Maintenance scope: fixes and compatibility maintenance. Published versions are listed on [npm](https://www.npmjs.com/package/thu-tok-auto); changes are recorded in the [changelog](CHANGELOG.md).
 
-The host contracts were historically checked against DSH `0.2.0-rc.2`. Browser discovery and process cleanup primarily target Windows with Edge or Chrome; other platforms have not completed real-device acceptance. **Automatic renewal against the live THU service remains unverified**: mocked regressions do not establish that the server will accept a restored session or a hidden browser's fingerprint. This documentation update does not certify a new live test.
+The host contracts were historically checked against DSH `0.2.0-rc.2`. Browser discovery and process cleanup primarily target Windows with Edge or Chrome; other platforms have not completed real-device acceptance. **Automatic renewal against the live THU service remains unverified**: mocked regressions do not establish that the server will accept a restored session or a hidden browser's fingerprint. A live manual Get completed with stored credentials on Windows.
 
 ## Requirements
 
@@ -41,7 +41,7 @@ The command is the existing documented DSH installation interface; this document
 
 The timer measures local time since the last recorded Get, **not time until token expiry**. It displays `--:--` without a baseline and caps the hour field at 99. Hover details separate the last manual request from the last automatic run.
 
-To assess live Auto behavior, expiry must advance on a natural automatic run after login. No account login or live renewal was performed for this documentation candidate; do not infer that acceptance from the UI or unit tests.
+To assess live Auto behavior, expiry must advance on a natural automatic run after login. The live manual Get check does not establish the outcome of a timer-triggered run.
 
 ## Configuration, data and permissions
 
@@ -53,6 +53,7 @@ It identifies a provider by the credential reference or MadModel base URL, inclu
 | --- | --- |
 | DSH credential `MADMODEL_API_KEY` | Stores the API token. Storage protection is provided by DSH; this plugin does not claim a separate encrypted vault. |
 | `%USERPROFILE%\.dsh\madmodel\state.json` | Stores cookies/SSO session material, Auto preference, timestamps and diagnostics. New state omits the token; legacy tokens are migrated to DSH credentials. Treat the entire file as a credential. |
+| `%USERPROFILE%\.dsh\madmodel\credentials.dpapi.json` (optional) | Only if you save an account for automatic login: your unified-identity account and password, sealed with Windows DPAPI at **CurrentUser** scope, restricted to your Windows account, and never written to the state file, the profile configuration or the log. Clear it from the panel to remove it. |
 | `%USERPROFILE%\.dsh\madmodel\profile\` and temporary carrier profiles | Browser login/session data. Owned temporary carrier profiles may be cleaned up; persistent state and the shared login profile are not a logout mechanism. |
 | Browser launch, loopback DevTools ports 9333–9343 and process inspection | Capture login and restore saved sessions only after checking browser ownership. Windows fallback termination requires matching recorded process identity; it does not kill browsers by name. |
 | DSH settings and credential writes | Configure the selected provider and replace its token after validation. Removing the plugin does not automatically undo these writes. |
@@ -60,6 +61,20 @@ It identifies a provider by the credential reference or MadModel base URL, inclu
 The state writer requests file mode `0600` on a best-effort basis; that is **not a guarantee of Windows ACL isolation or encryption**. Protect the host user account, backups and directory access. Never attach the state file, browser profile, credential store, authentication URLs or raw diagnostics to a public issue.
 
 The plugin makes authentication/model-list requests to MadModel and THU identity services and uses local DevTools connections. Cookies are selected by destination domain, path, secure flag and expiry; restored browser cookies are subject to ownership and host checks. There is no telemetry submission in the plugin's current implementation. This statement does not cover the host, browser or remote service's own data handling.
+
+### Optional automatic login
+
+Without a stored account, a dead SSO session ends the same way it always has: the ladder reports that a person is needed, Auto opens nothing, and a click opens the login window.
+
+You may instead save your Tsinghua unified-identity account in the panel's **账号** (account) button. Then, and only when the SSO chain has answered a real password form, a run may finish that one step itself:
+
+- it happens in a browser this plugin started, with no window, and only after the DevTools instance id on that port matches the one recorded at spawn;
+- the page must be the top frame on `https://id.tsinghua.edu.cn`, with an identifiable password form and a single password field, and no CAPTCHA, second factor or device-confirmation step — otherwise nothing is typed;
+- the values go in as input text (never as a script), the form is submitted once, and the browser is closed if the page did not leave the login form;
+- a definite rejection stops automatic login until you save or clear the account; an unclear result counts against a budget of three, so an account is not hammered;
+- a visible window is never opened by an unattended run, and clearing the account invalidates an attempt already in flight.
+
+Saving an account is optional. **A live manual Get verified login with a stored account on Windows** — see [Limitations and troubleshooting](#limitations-and-troubleshooting).
 
 ### Renewal and model-list behavior
 
@@ -89,6 +104,8 @@ Unloading attempts to close only an identifiable plugin-owned browser. **It does
 - **Network unreachable / validation unknown:** check connectivity first; these messages alone do not establish that the token was revoked.
 - **Token updated, provider not synchronized:** treat the operation as partial and inspect the configuration error without posting secrets.
 - **Browser ownership cannot be verified:** cleanup refuses uncertain ownership. Do not stop unrelated browsers. `node lib/stop-owned.js --dry-run` inspects the plugin's local ownership record; `node lib/stop-owned.js` attempts verified cleanup. These are operational commands, not privacy-safe report generators.
+- **Automatic login did not run:** the account is not saved, this machine cannot use DPAPI, or a previous attempt was refused and the panel says so. Saving or clearing the account lifts a refusal; a CAPTCHA or second factor is reported by name and is never bypassed.
+- **Login form changes:** The plugin recognizes the current THU password tab and uses the site’s own submit action. If the identity service changes its page, the arm refuses rather than guesses, and you still have the login window.
 - **Timer differs from service behavior:** the panel decodes JWT `exp` against the local clock; keep system time synchronized. Historical six-hour token life and approximately 45-minute reusable SSO sessions are observations, not guaranteed limits.
 - Do not manually join lines from DSH's YAML credential file: quoted YAML continuation escapes are not part of the token. Use DSH's credential service or a YAML parser when appropriate.
 
@@ -103,7 +120,7 @@ npm run check
 npm test
 ```
 
-The package uses Node built-ins and host-provided services; `package.json` declares no runtime dependencies. `npm run check` checks syntax and host/bundle contracts. Tests use dependency-injected environments and fixtures. The 213 fixture regressions and bundle checks are used for release preparation. Live THU login and natural Auto renewal still require separate acceptance against the service. `prepack` normally runs both commands.
+The package uses Node built-ins and host-provided services; `package.json` declares no runtime dependencies. `npm run check` checks syntax and host/bundle contracts. Tests use dependency-injected environments and fixtures. Release preparation runs the fixture suite and bundle checks. The live manual Get check covered login, token validation and storage. Timer-triggered renewal remains unverified. `prepack` normally runs both commands.
 
 `lib/core.js` contains lifecycle and synchronization logic; `lib/index.js` wires host services, routes and browser adapters; `lib/ui.js` renders the control. `test/preview/` is an isolated fake-state preview and is excluded from the npm package. Source-only reports and private migration/orchestration material must not be added to the package.
 

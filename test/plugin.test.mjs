@@ -170,6 +170,11 @@ function createRuntime(options = {}) {
     // a test asks for it: "this host cannot hand one out" is a state the plugin has to handle,
     // and the 122 assertions that predate the carrier all run on such a host.
     ...(options.hiddenTarget ? { hiddenTarget: options.hiddenTarget } : {}),
+    // The optional account store and its one-shot login arm (2026-11-28). Absent unless a
+    // test asks for it: a build with no stored account is the state every test before this
+    // feature ran in, and it must keep behaving exactly as it did.
+    ...(options.autoLogin ? { autoLogin: options.autoLogin } : {}),
+    ...(options.secretStore ? { secretStore: options.secretStore } : {}),
     timer: hostTimer,
   })
   return {
@@ -624,6 +629,9 @@ function hostShellCtx(overrides = {}) {
   const services = {
     webServer: {
       register(e) {
+        if (routes.some((route) => !route.disposed && route.kind === e.kind && route.path === e.path)) {
+          throw new Error('webserver: duplicate ' + e.kind + ' route "' + e.path + '"')
+        }
         e.disposed = false
         routes.push(e)
         return () => { e.disposed = true }
@@ -683,6 +691,11 @@ test('host shell registers API routes, injects the UI script once, and starts Au
     '/thu-tok-auto/api/get-tok',
     '/thu-tok-auto/api/open-login',
     '/thu-tok-auto/api/set-auto',
+    // The optional account store's three routes (2026-11-28): read the configured state, save
+    // or replace, clear. They answer with names only and never echo a value back.
+    '/thu-tok-auto/api/credentials',
+    '/thu-tok-auto/api/credentials/save',
+    '/thu-tok-auto/api/credentials/clear',
     '/thu-tok-auto/ui.js',
   ])
   assert.equal(indexListeners.length, 1)
@@ -4793,4 +4806,218 @@ test('without the restore seam the carrier keeps its old address, so a half-buil
   assert.equal(click.loginOpened, 'headless')
   const argv = rt.spawns[0].argv
   assert.equal(argv[argv.length - 1], SSO_LOGIN_URL, '没有恢复能力时，行为与本轮之前一模一样')
+})
+
+// ---- the optional account arm (2026-11-28) ------------------------------------------
+// What these measure: the ladder's decision to use a stored account, and what it does with
+// each answer. The browser side is a seam here — the CDP driver is exercised in
+// test/auto-login.test.mjs and on a real Edge only by a probe, never in this suite.
+
+const ACCOUNT_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+
+function accountArm(options = {}) {
+  const calls = []
+  const arm = {
+    calls,
+    async attempt(arg) {
+      calls.push(arg)
+      if (typeof options.driver === 'function') return options.driver(arg, calls.length)
+      return { attempted: true, ok: true, reason: 'submitted', submitted: true }
+    },
+  }
+  return arm
+}
+
+// A session that is gone: the IDP answers the password form, so the ladder's last resort is
+// the one this feature is about.
+function loginFormRun(options = {}) {
+  // Only the port this run's browser took answers with an instance id; every other port in the
+  // range is quiet. That is what the real scan sees, and it keeps a second run from mistaking
+  // the first run's closed browser for a stranger on every port.
+  let heldPort = 0
+  const spawns = []
+  const cdp = options.cdp || (async (arg) => {
+    const port = Number((arg && arg.port) || 0)
+    if (arg && arg.probeOnly) {
+      return heldPort && port === heldPort
+        ? { ok: true, running: true, browserId: ACCOUNT_UUID }
+        : { ok: false, running: false, reason: 'no-devtools' }
+    }
+    return { ok: false, running: true, reason: 'no-target' }
+  })
+  const spawnBrowser = async (exe, argv) => {
+    for (const a of argv || []) {
+      const m = String(a).match(/^--remote-debugging-port=(\d+)$/)
+      if (m) heldPort = Number(m[1])
+    }
+    spawns.push({ exe, argv })
+    return { pid: 4321 }
+  }
+  const rt = createRuntime({
+    clockNow: options.clockNow || (() => 1000000),
+    stateData: { lastGetAt: 0, auto: true, cookies: '', ssoCookies: '', cookieJar: ssoJar },
+    http({ url }) {
+      if (url.indexOf('id.tsinghua.edu.cn') !== -1) return okResponse(IDP_LOGIN_FORM)
+      if (url.endsWith('/model-api/auth-login/check')) return { status: 401, ok: false, location: '', text: '' }
+      if (url.endsWith('/model-api/auth-login')) return { status: 401, ok: false, location: '', text: '' }
+      return { status: 500, ok: false, location: '', text: '' }
+    },
+    cdp,
+    spawnBrowser,
+    ...options,
+  })
+  // This fixture needs the spawn to be observable (it decides which port answers), so it
+  // records the calls itself; the tests read them through the same `rt.spawns` they always do.
+  rt.spawns = spawns
+  return rt
+}
+
+test('a due background run with a stored account fills the login form itself, with no window', async () => {
+  const arm = accountArm()
+  const rt = loginFormRun({ autoLogin: arm })
+  await rt.core.init()
+  const tick = await rt.core.autoTick()
+  const state = await rt.core.state()
+
+  assert.equal(arm.calls.length, 1, 'one attempt, and only one')
+  assert.equal(arm.calls[0].uuid, ACCOUNT_UUID, 'the attempt names the instance this run started')
+  assert.equal(rt.spawns.length, 1, 'one browser, started by this plugin')
+  assert.ok(rt.spawns[0].argv.indexOf('--headless=new') !== -1, 'an unattended run never puts a window on screen')
+  assert.equal(tick.loginOpened, 'headless')
+  assert.equal(state.browserOpen, true, 'the carrier is up and being watched')
+  assert.equal(state.status, 'processing')
+  assert.equal(state.autoLogin.reason, 'submitted')
+  assert.equal(state.autoLogin.submitted, true)
+  assert.equal(state.autoLoginBlocked, null)
+  assert.ok(String(state.err).indexOf('账号') !== -1, 'the panel says an account was used, not that a person is needed')
+})
+
+test('without a stored account the login-form step asks for a person exactly as before', async () => {
+  const rt = loginFormRun()
+  await rt.core.init()
+  const tick = await rt.core.autoTick()
+  const state = await rt.core.state()
+  assert.equal(rt.spawns.length, 0, 'nothing is started for an account that does not exist')
+  assert.equal(tick.loginOpened, 'none')
+  assert.equal(tick.loginRequired, true)
+  assert.equal(state.loginReason, 'needs-manual-login')
+  assert.equal(state.autoLogin, null)
+})
+
+test('a rejected account stops the arm until the stored account changes', async () => {
+  const arm = accountArm({ driver: async () => ({ attempted: true, ok: false, reason: 'credentials-rejected', revision: 'rev-1' }) })
+  const rt = loginFormRun({ autoLogin: arm })
+  await rt.core.init()
+  await rt.core.autoTick()
+  let state = await rt.core.state()
+  assert.equal(arm.calls.length, 1)
+  assert.equal(state.loginReason, 'credentials-rejected')
+  assert.equal(state.autoLoginBlocked.reason, 'credentials-rejected')
+  assert.equal(state.autoLoginBlocked.revision, 'rev-1')
+  assert.ok(String(state.err).indexOf('账号或密码错误') !== -1, 'the panel names the rejection')
+  assert.equal(state.browserOpen, false, 'the browser it started was closed again')
+
+  // The next due run must not try again: a wrong password does not become right with time.
+  await rt.core.autoTick()
+  state = await rt.core.state()
+  assert.equal(arm.calls.length, 1, 'still one attempt across two runs')
+  assert.equal(rt.spawns.length, 1)
+
+  // Saving a new account is the one thing that lifts it.
+  await rt.core.credentialsChanged()
+  state = await rt.core.state()
+  assert.equal(state.autoLoginBlocked, null)
+  assert.equal(state.autoLogin, null)
+})
+
+test('a step this arm must not pass is named, and does not count against the account', async () => {
+  const arm = accountArm({ driver: async () => ({ attempted: true, ok: false, reason: 'captcha-required' }) })
+  const rt = loginFormRun({ autoLogin: arm })
+  await rt.core.init()
+  await rt.core.autoTick()
+  const state = await rt.core.state()
+  assert.equal(state.loginReason, 'captcha-required')
+  assert.equal(state.autoLoginBlocked, null, 'a CAPTCHA is not a wrong password')
+  assert.equal(state.autoLogin.reason, 'captcha-required')
+  assert.equal(state.browserOpen, false)
+  assert.ok(String(state.err).indexOf('验证码') !== -1)
+})
+
+test('three unanswered attempts stop the arm, and the budget is not quietly refilled', async () => {
+  const arm = accountArm({ driver: async () => ({ attempted: true, ok: false, reason: 'timeout' }) })
+  // Auto's cadence is real time: each due tick needs the clock to have moved on, or the run
+  // never starts and the test would be measuring the schedule instead of the budget.
+  let now = 1000000
+  const rt = loginFormRun({ autoLogin: arm, clockNow: () => now })
+  await rt.core.init()
+  for (let i = 0; i < 3; i++) {
+    now += 21 * 60e3
+    await rt.core.autoTick()
+  }
+  let state = await rt.core.state()
+  assert.equal(arm.calls.length, 3, 'three attempts, then the budget is spent')
+  assert.equal(state.autoLoginBlocked.reason, 'attempt-limit')
+
+  now += 21 * 60e3
+  await rt.core.autoTick()
+  state = await rt.core.state()
+  assert.equal(arm.calls.length, 3, 'a spent budget is not quietly refilled')
+  assert.equal(state.autoLoginBlocked.reason, 'attempt-limit')
+})
+
+test('a carrier refusal leaves the arm available and the panel says why nothing was typed', async () => {
+  const arm = accountArm({ driver: async () => ({ attempted: true, ok: false, reason: 'wrong-origin' }) })
+  const rt = loginFormRun({ autoLogin: arm })
+  await rt.core.init()
+  await rt.core.autoTick()
+  const state = await rt.core.state()
+  assert.equal(state.autoLogin.reason, 'wrong-origin')
+  assert.equal(state.autoLoginBlocked, null, 'a page that was not the login form is not the account\'s fault')
+  assert.equal(state.browserOpen, false, 'the browser it started did not outlive the run')
+  assert.ok(String(state.err).indexOf('统一认证') !== -1)
+})
+test('a submitted form whose verdict has not arrived is handed to the capture, not thrown away', async () => {
+  const arm = accountArm({ driver: async () => ({ attempted: true, ok: false, reason: 'timeout', submitted: true }) })
+  const rt = loginFormRun({ autoLogin: arm })
+  await rt.core.init()
+  await rt.core.autoTick()
+  const state = await rt.core.state()
+  assert.equal(arm.calls.length, 1)
+  // The click already put the account in; closing the browser here would discard a login that
+  // is still completing. The capture arm is what decides, and its own timeout bounds it.
+  assert.equal(state.browserOpen, true, 'the carrier stays up for the capture to read')
+  assert.equal(state.status, 'processing')
+  assert.equal(state.autoLogin.reason, 'timeout')
+  assert.ok(String(state.err).indexOf('已提交') !== -1, 'the sentence does not claim the login finished')
+})
+test('clearing the account mid-attempt makes the late verdict inert, and the driver is told', async () => {
+  let release = null
+  const gate = new Promise((resolve) => { release = resolve })
+  let sawCancelled = null
+  const arm = accountArm({
+    driver: async (arg) => {
+      await gate
+      sawCancelled = arg.cancelled()
+      // A driver that only discovers the cancellation after the fact still must not have its
+      // verdict taken as a success by the caller.
+      return { attempted: true, ok: true, reason: 'submitted', submitted: true }
+    },
+  })
+  const rt = loginFormRun({ autoLogin: arm })
+  await rt.core.init()
+
+  const tickPromise = rt.core.autoTick()
+  for (let i = 0; i < 200 && arm.calls.length === 0; i++) await new Promise((r) => setTimeout(r, 5))
+  assert.equal(arm.calls.length, 1, 'the attempt started')
+
+  // The user clears the account while the driver is still in its handshake/navigation.
+  await rt.core.credentialsChanged()
+  release()
+  await tickPromise
+
+  assert.equal(sawCancelled, true, 'core must answer "cancelled" to the driver, not just discard later')
+  const state = await rt.core.state()
+  assert.equal(state.autoLogin, null, 'a cleared account leaves no attempt record behind')
+  assert.equal(state.autoLoginBlocked, null)
+  assert.equal(state.browserOpen, false, 'the carrier is given up instead of watching a login nobody asked for')
 })
